@@ -1,115 +1,142 @@
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Callable
-
-from agent.memory import AgentMemory
-from agent.tools import AgentTools
-from schema import AgentInput, AgentResult, LensDesignParams
+from dataclasses import dataclass, field
+from typing import Any, Callable
 
 
-class LensResearchAgent:
-    def __init__(self, default_params: LensDesignParams, project_root: Path):
-        self.default_params = default_params
-        self.project_root = project_root
-        self.memory = AgentMemory(project_root / "src" / "memory")
-        self.tools = AgentTools(default_params)
+@dataclass
+class ReactTurn:
+    thought: str
+    action: str | None = None
+    action_input: dict[str, Any] = field(default_factory=dict)
+    observation: str = ""
+    done: bool = False
+    data: dict[str, Any] = field(default_factory=dict)
 
-    def run(self, request: AgentInput, progress_cb: Callable[[str], None] | None = None) -> AgentResult:
-        timeline: list[str] = []
-        snapshot = self.memory.create_snapshot()
 
-        def emit(message: str) -> None:
-            timeline.append(message)
-            snapshot["timeline"].append(message)
-            if progress_cb:
-                progress_cb(message)
+@dataclass
+class ReactState:
+    objective: str
+    turn: int
+    trace: list[dict[str, Any]]
+    memory: dict[str, Any] = field(default_factory=dict)
+    available_tools: list[str] = field(default_factory=list)
+    system_prompt: str = ""
+    context: dict[str, Any] = field(default_factory=dict)
 
-        emit("解析输入")
-        if request.mode == "nl":
-            if not request.prompt:
-                return self._finalize(request, AgentResult(ok=False, summary="自然语言输入为空"))
-            params = self.tools.requirements.parse(request.prompt)
-            emit("已完成自然语言参数解析")
-        else:
-            if request.params is None:
-                return self._finalize(request, AgentResult(ok=False, summary="结构化参数输入为空"))
-            params = request.params
-            emit("已加载结构化参数")
 
-        if request.controls is not None:
-            params.iterations = int(request.controls.iterations)
-            params.spp = int(request.controls.spp)
-            params.test_per_iter = int(request.controls.test_per_iter)
-            emit(
-                "已应用优化预算 "
-                f"(iterations={params.iterations}, spp={params.spp}, test_per_iter={params.test_per_iter})"
-            )
+ReactStep = Callable[[ReactState], ReactTurn]
+ReactEmit = Callable[[str], None]
 
-        references: list[dict] = []
-        if request.enable_patent_search:
-            emit("开始专利检索")
-            query = f"f{params.foclen}mm f/{params.fnum} fov {params.fov}"
-            references = self.tools.patents.search(query)
-            emit(f"专利检索完成，共 {len(references)} 条")
-        else:
-            emit("已跳过专利检索")
 
-        emit("开始执行镜头设计")
-        try:
-            design_result = self.tools.design.run(params, progress_cb=emit)
-        except Exception as exc:
-            result = AgentResult(
-                ok=False,
-                summary=f"Lens design failed: {exc}",
-                references=references,
-                timeline=timeline,
-                memory_snapshot=snapshot,
-            )
-            return self._finalize(request, result)
+ACTION_LABELS: dict[str, str] = {
+    "parse_requirements": "解析需求",
+    "seed_from_cases": "检索参考案例",
+    "optimize_lens": "运行镜头优化",
+    "evaluate_lens": "评估优化结果",
+    "evaluate_acceptance": "验收设计结果",
+    "analyze_zemax": "分析 Zemax 结果",
+    "record_memory": "记录经验记忆",
+    "archive_report_and_memory": "归档报告和记忆",
+}
 
-        emit("开始像质评估")
-        metrics = self.tools.evaluation.evaluate(design_result["result_dir"])
-        metrics.update(
-            {
-                "rfov": design_result.get("rfov"),
-                "fnum": design_result.get("fnum"),
-                "r_sensor": design_result.get("r_sensor"),
-                "patent_hits": references,
-            }
-        )
 
-        summary = (
-            f"Lens design finished. Artifact score={metrics.get('artifact_score')}, "
-            f"spot_rms_edge={metrics.get('spot_rms_um_edge')}um, "
-            f"distortion_edge={metrics.get('distortion_pct_edge')}%, "
-            f"MTF50_center_tan={metrics.get('mtf50_center_tan_cy_mm')} cy/mm."
-        )
-        result = AgentResult(
-            ok=True,
-            summary=summary,
-            result_dir=design_result.get("result_dir"),
-            curriculum_json=design_result.get("curriculum_json"),
-            final_json=design_result.get("final_json"),
-            log_file=design_result.get("log_file"),
-            metrics=metrics,
-            references=references,
-            timeline=timeline,
-            memory_snapshot=snapshot,
-        )
-        emit("任务完成")
-        return self._finalize(request, result, params=params)
+OBJECTIVE_MESSAGES: dict[str, str] = {
+    "将用户意图解析为光学设计上下文": "需求解析：准备上下文。",
+    "选择并验证初始光学结构": "初始结构选择：准备参考检索。",
+    "优化、评估并判断光学性能": "优化与评估：准备运行优化。",
+    "归档运行结果并更新分层记忆": "报告归档：准备归档结果。",
+}
 
-    def _finalize(
+
+ACTION_MESSAGES: dict[str, str] = {
+    "parse_requirements": "解析需求：整理结构化参数。",
+    "seed_from_cases": "初始结构选择：生成参考初始结构。",
+    "optimize_lens": "优化与评估：运行镜头优化。",
+    "evaluate_lens": "优化与评估：评估优化结果。",
+    "evaluate_acceptance": "验收设计结果：对比目标指标。",
+    "analyze_zemax": "Zemax 分析：完成独立评估。",
+    "record_memory": "报告归档：记录失败记忆。",
+    "archive_report_and_memory": "报告归档：归档报告和记忆。",
+}
+
+
+def _action_label(action: str | None) -> str:
+    if not action:
+        return ""
+    return ACTION_LABELS.get(action, action.replace("_", ""))
+
+
+def _objective_message(objective: str) -> str:
+    return OBJECTIVE_MESSAGES.get(objective, f"正在处理：{objective}。")
+
+
+def _action_message(action: str | None) -> str:
+    if not action:
+        return ""
+    return ACTION_MESSAGES.get(action, f"{_action_label(action)}：已完成。")
+
+
+class ReactAgentLoop:
+    """Bounded ReAct loop used inside workflow nodes."""
+
+    def __init__(self, name: str, *, max_turns: int = 4) -> None:
+        self.name = name
+        self.max_turns = max(1, int(max_turns))
+
+    def run(
         self,
-        request: AgentInput,
-        result: AgentResult,
-        params: LensDesignParams | None = None,
-    ) -> AgentResult:
-        self.memory.append_episode(request, result)
-        if result.ok and params is not None:
-            self.memory.add_note(
-                f"Target f={params.foclen}mm F/{params.fnum} FoV={params.fov} "
-                f"achieved artifact_score={result.metrics.get('artifact_score')}"
+        objective: str,
+        step: ReactStep,
+        emit: ReactEmit | None = None,
+        *,
+        memory: dict[str, Any] | None = None,
+        available_tools: list[str] | None = None,
+        system_prompt: str = "",
+        context: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        trace: list[dict[str, Any]] = []
+        state_context = context or {}
+        if emit:
+            emit(_objective_message(objective))
+
+        for turn in range(self.max_turns):
+            state = ReactState(
+                objective=objective,
+                turn=turn,
+                trace=trace,
+                memory=memory or {},
+                available_tools=available_tools or [],
+                system_prompt=system_prompt,
+                context=state_context,
             )
-        return result
+            decision = step(state)
+            row = {
+                "agent": self.name,
+                "turn": turn,
+                "objective": objective,
+                "system_prompt": state.system_prompt,
+                "context": state.context,
+                "available_tools": state.available_tools,
+                "thought": decision.thought,
+                "action": decision.action,
+                "action_input": decision.action_input,
+                "observation": decision.observation,
+                "done": decision.done,
+                "data": decision.data,
+            }
+            trace.append(row)
+
+            if emit:
+                emit(self._format_turn(decision))
+            if decision.done:
+                break
+
+        return trace
+
+    @staticmethod
+    def _format_turn(turn: ReactTurn) -> str:
+        thought = turn.thought.strip().rstrip("。")
+        if turn.action:
+            return _action_message(turn.action)
+        return f"检查：{thought}。" if thought else "继续处理中。"

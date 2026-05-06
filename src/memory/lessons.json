@@ -1,0 +1,57 @@
+{
+  "version": 1,
+  "entries": [
+    {
+      "id": "curriculum-focus-weight-drift",
+      "topic_key": "curriculum-focus-weight-drift",
+      "title": "Low curriculum w_focus and LR spikes cause catastrophic specification drift",
+      "category": "optimization_strategy",
+      "lesson": "When w_focus is set too low (e.g., 0.1) during curriculum, the optimizer does not strongly constrain EFL, F-number, and FOV, allowing drift exceeding 300%. LR spikes in both curriculum and fine-tune phases (e.g., 0.0001→0.01, a 100× increase) amplify this drift. Once drift exceeds ~100%, fine-tuning with higher w_focus cannot recover the design.",
+      "applicability": [
+        "All lens design runs using curriculum optimization with separable focus and aberration weights",
+        "Any run where EFL/F-number/FOV must stay within tight tolerances of target values"
+      ],
+      "signals": [
+        "EFL drift >50% from target after curriculum",
+        "F-number drift >50% from target",
+        "FOV drift >30% from target",
+        "w_focus < 0.3 in curriculum config",
+        "LR ratio >10× between consecutive curriculum phases (increasing direction)",
+        "Spot RMS >1mm and MTF50 <5 cy/mm at any field",
+        "LR ratio >10× between consecutive phases (increasing direction) in curriculum or fine-tune",
+        "Fine-tune fails to recover specification drift from curriculum"
+      ],
+      "guidance": [
+        "Set w_focus ≥ 0.3 during curriculum to keep EFL/F-number/FOV anchored to targets",
+        "Ensure curriculum LR schedule is monotonically decreasing or flat; never increase LR by more than 5× between phases",
+        "Monitor specification drift after each curriculum phase; if drift exceeds 20%, raise w_focus before continuing",
+        "Consider starting with w_focus=0.5 and tapering aberration weights in, rather than keeping focus weight low",
+        "Ensure both curriculum and fine-tune LR schedules are monotonically decreasing or flat; never increase LR by more than 5× between phases",
+        "If curriculum drift exceeds 100%, restart with corrected weights rather than attempting fine-tune recovery"
+      ],
+      "parameter_hints": [
+        "curriculum.w_focus: 0.3–1.0",
+        "curriculum.lrs: monotonically decreasing (e.g., [0.01, 0.003, 0.001, 0.0003])",
+        "curriculum.max_lr_ratio_between_phases: ≤5",
+        "w_focus ≥ 0.3 for curriculum; ≥ 0.5 recommended for first phase",
+        "LR schedule: monotonically decreasing, max 5× ratio between adjacent phases",
+        "weight_dropout ≤ 0.05 when w_focus is low to avoid further destabilization"
+      ],
+      "anti_patterns": [
+        "w_focus=0.1 in curriculum with 30 iterations",
+        "LR schedule with a mid-optimization spike (e.g., [..., 0.0001, 0.01, ...])",
+        "Assuming fine-tune phase can recover from >100% specification drift",
+        "w_focus=0.1 in curriculum with large FOV targets",
+        "100× LR increase between consecutive curriculum or fine-tune phases",
+        "Assuming fine-tune can recover from severe (>100%) curriculum drift"
+      ],
+      "source_run_ids": [
+        "20260505-231553",
+        "20260506-111524"
+      ],
+      "created_at": "2026-05-05T23:18:19",
+      "updated_at": "2026-05-06T11:17:05",
+      "revision_count": 2
+    }
+  ]
+}
