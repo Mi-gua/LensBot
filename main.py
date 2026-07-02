@@ -1,21 +1,21 @@
 from __future__ import annotations
 
-import os
-import sys
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parent
-os.environ.setdefault("MPLBACKEND", "Agg")
-os.environ.setdefault("MPLCONFIGDIR", str(PROJECT_ROOT / ".cache" / "matplotlib"))
 
-SRC_ROOT = PROJECT_ROOT / "src"
-if str(SRC_ROOT) not in sys.path:
-    sys.path.insert(0, str(SRC_ROOT))
+def _enable_local_imports() -> None:
+    src_root = Path(__file__).resolve().parent / "src"
+    src_root_text = str(src_root)
+    import sys
 
-from agent.ui import run_server
+    if src_root_text not in sys.path:
+        sys.path.insert(0, src_root_text)
 
 
 def main() -> None:
+    _enable_local_imports()
+    from ui.gui import run_server
+
     run_server()
 
 

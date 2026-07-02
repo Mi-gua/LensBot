@@ -2,7 +2,7 @@
 
 ## Role
 
-- Design and optimize optical lens systems with workflow-level planning and node-level agent loops.
+- Design and optimize optical lens systems with workflow-level planning and pi-backed optimization control.
 
 ## Tool Boundaries
 

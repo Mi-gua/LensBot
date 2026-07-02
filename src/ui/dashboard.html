@@ -1,0 +1,332 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LensBot &#25511;&#21046;&#21488;</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&family=Orbitron:wght@700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/ui/dashboard.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="app-header">
+      <div class="header-inner">
+        <a class="brand-link" href="#" data-view="run" aria-label="LensBot &#39318;&#39029;">
+          <span class="brand-mark"><img class="brand-icon" src="/ui/assets/lensbot-icon.png" alt=""></span>
+          <span>LensBot</span>
+        </a>
+        <nav class="header-nav" aria-label="&#20027;&#23548;&#33322;">
+          <button type="button" data-view="run" class="active">&#24037;&#20316;&#21488;</button>
+          <button type="button" data-view="process">&#20248;&#21270;</button>
+          <button type="button" data-view="results">&#32467;&#26524;</button>
+          <button type="button" data-view="config">&#37197;&#32622;</button>
+        </nav>
+        <div class="status-mini"><span class="dot"></span><span>&#20809;&#23398;&#35774;&#35745;&#21161;&#25163;</span></div>
+      </div>
+    </header>
+
+    <div class="app-layout">
+      <aside class="app-sidebar" aria-label="LensBot &#39029;&#38754;">
+        <div class="nav-group">
+          <div class="side-nav">
+            <button type="button" data-view="run" class="active"><span class="nav-index">01</span><span class="nav-label">&#24037;&#20316;&#21488;</span></button>
+            <button type="button" data-view="process"><span class="nav-index">02</span><span class="nav-label">&#20248;&#21270;</span></button>
+            <button type="button" data-view="results"><span class="nav-index">03</span><span class="nav-label">&#32467;&#26524;</span></button>
+            <button type="button" data-view="config"><span class="nav-index">04</span><span class="nav-label">&#37197;&#32622;</span></button>
+          </div>
+        </div>
+      </aside>
+
+      <main class="app-main">
+        <section class="page-hero compact-hero">
+          <div>
+            <h1 class="page-title">
+              <span class="page-title-mark"><img class="page-title-icon" src="/ui/assets/lensbot-icon.png" alt=""></span>
+              <span>LensBot</span>
+            </h1>
+          </div>
+          <aside class="status-panel">
+            <div class="status-state" id="status-state">&#31354;&#38386;</div>
+            <p class="status-copy" id="status-copy">&#31561;&#24453;&#26032;&#30340;&#35774;&#35745;&#20219;&#21153;&#12290;</p>
+            <span class="elapsed-pill mono">&#29992;&#26102; <strong id="elapsed-pill">00:00</strong></span>
+          </aside>
+        </section>
+
+        <section class="page-view active" id="view-run">
+          <div class="workbench-grid">
+            <section class="card control-card">
+              <div class="control-head">
+                <div>
+                  <p class="eyebrow">&#36755;&#20837;</p>
+                  <h2 class="section-title">&#20219;&#21153;&#36755;&#20837;</h2>
+                </div>
+                <div class="pill mono control-meta" id="model-pill">&#27169;&#22411;&#26410;&#37197;&#32622;</div>
+              </div>
+
+              <div class="section-block">
+                <p class="section-label">&#36755;&#20837;&#27169;&#24335;</p>
+                <div class="toggle" id="mode-toggle">
+                  <button type="button" data-mode="natural" class="active">&#33258;&#28982;&#35821;&#35328;&#36755;&#20837;</button>
+                  <button type="button" data-mode="params">&#30446;&#26631;&#21442;&#25968;&#36755;&#20837;</button>
+                </div>
+              </div>
+
+              <div class="section-block">
+                <p class="section-label">&#20219;&#21153;&#25551;&#36848;</p>
+                <div id="nl-block">
+                  <label for="nl_prompt">&#33258;&#28982;&#35821;&#35328;&#30446;&#26631;</label>
+                  <textarea id="nl_prompt">&#35831;&#20026;&#20840;&#30011;&#24133;&#30456;&#26426;&#35774;&#35745;&#19968;&#20010;&#26631;&#20934;&#38236;&#22836;&#65306;&#28966;&#36317; 52 mm&#65292;F/2.9&#65292;&#20840;&#35270;&#22330; 43 &#24230;&#65292;&#21518;&#28966;&#36317; 18 mm&#65292;&#24635;&#21402;&#24230;&#25511;&#21046;&#22312; 120 mm &#24038;&#21491;&#12290;&#20248;&#20808;&#20445;&#25345; EFL&#12289;FOV &#21644; F &#25968;&#25509;&#36817;&#30446;&#26631;&#65292;&#20854;&#27425;&#20248;&#21270;&#20013;&#24515;&#21644;&#36793;&#32536; RMS spot&#12289;&#30072;&#21464;&#21644; MTF&#12290;</textarea>
+                </div>
+
+                <div id="param-block" style="display:none;">
+                  <div class="triple">
+                    <div>
+                      <label for="foclen">&#28966;&#36317; (mm)</label>
+                      <input id="foclen" type="number" step="0.1">
+                    </div>
+                    <div>
+                      <label for="fov">&#35270;&#22330; (deg)</label>
+                      <input id="fov" type="number" step="0.1">
+                    </div>
+                    <div>
+                      <label for="fnum">F &#25968;</label>
+                      <input id="fnum" type="number" step="0.1">
+                    </div>
+                  </div>
+                  <div class="row">
+                    <div>
+                      <label for="bfl">&#21518;&#28966;&#36317; (mm)</label>
+                      <input id="bfl" type="number" step="0.1">
+                    </div>
+                    <div>
+                      <label for="thickness">&#24635;&#21402;&#24230; (mm)</label>
+                      <input id="thickness" type="number" step="0.1">
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div class="cta">
+                <button class="primary" id="run-btn" type="button">&#24320;&#22987;&#36816;&#34892;</button>
+                <button class="secondary" id="reset-btn" type="button">&#37325;&#32622;</button>
+                <button class="secondary" type="button" data-view="config">&#21442;&#25968;&#39044;&#35774;</button>
+              </div>
+            </section>
+
+            <div class="workbench-side">
+              <section class="stage-card trace-card">
+                <div class="console">
+                  <div class="console-head">
+                    <h2 class="console-title">&#36816;&#34892;&#36712;&#36857;</h2>
+                    <div class="pill"><span class="dot"></span><span>&#23454;&#26102;</span></div>
+                  </div>
+                  <ul id="timeline">
+                    <li class="timeline-item timeline-item--info"><strong>&#20219;&#21153;&#25509;&#25910;</strong><span>LensBot &#24050;&#23601;&#32490;&#12290;</span></li>
+                  </ul>
+                </div>
+              </section>
+            </div>
+          </div>
+        </section>
+
+        <section class="page-view" id="view-process">
+          <div class="process-layout">
+            <section class="stage-card process-card process-transcript-card">
+              <div class="toolbar">
+                <h2>优化过程</h2>
+                <div class="pill"><span class="dot"></span><span>智能体</span></div>
+              </div>
+              <div class="optimization-progress-panel" id="optimization-progress-panel"></div>
+              <div class="list-card sources-list" id="optimization-stages">
+                <div class="empty">运行后显示优化智能体的原生消息、工具调用和工具结果。</div>
+              </div>
+            </section>
+
+            <aside class="process-side-rail">
+              <section class="stage-card process-card current-snapshot-card">
+                <div class="toolbar">
+                  <h2>&#24403;&#21069;&#38236;&#22836;&#20248;&#21270;&#24555;&#29031;</h2>
+                  <div class="pill"><span class="dot"></span><span>&#23454;&#26102;</span></div>
+                </div>
+                <div id="current-snapshot">
+                  <div class="empty">&#36816;&#34892;&#21518;&#27969;&#24335;&#26174;&#31034;&#24403;&#21069;&#20248;&#21270;&#24555;&#29031;&#12290;</div>
+                </div>
+              </section>
+
+              <section class="stage-card process-card seed-evidence-card">
+                <div class="toolbar">
+                  <h2>&#21021;&#22987;&#32467;&#26500;</h2>
+                  <div class="pill"><span class="dot"></span><span>结构</span></div>
+                </div>
+                <div class="seed-evidence-grid">
+                  <div class="list-card sources-list" id="references">
+                    <div class="empty">&#36816;&#34892;&#21518;&#26174;&#31034;&#26680;&#24515;&#21442;&#32771;&#26696;&#20363;&#12290;</div>
+                  </div>
+                  <div id="initial-structure">
+                    <div class="empty">&#36816;&#34892;&#21518;&#26174;&#31034;&#21021;&#22987;&#32467;&#26500;&#12290;</div>
+                  </div>
+                </div>
+              </section>
+
+            </aside>
+
+            <section class="stage-card process-card process-final-card">
+              <div class="toolbar">
+                <h2>&#26368;&#32456;&#35774;&#35745;</h2>
+                <div class="pill"><span class="dot"></span><span>&#32467;&#26524;</span></div>
+              </div>
+              <div id="lens-stage-gallery">
+                <div class="empty">&#36816;&#34892;&#21518;&#26174;&#31034;&#20851;&#38190;&#32467;&#26524;&#25688;&#35201;&#12290;</div>
+              </div>
+            </section>
+          </div>
+        </section>
+
+        <section class="page-view" id="view-results">
+          <div class="result-layout">
+            <section class="stage-card">
+              <div class="toolbar"><h2>&#24615;&#33021;&#25351;&#26631;</h2></div>
+              <div class="metrics" id="metrics">
+                <div class="empty">&#36816;&#34892;&#21518;&#26174;&#31034;&#24615;&#33021;&#25351;&#26631;&#12290;</div>
+              </div>
+            </section>
+
+            <section class="stage-card result-files-card">
+              <div class="toolbar"><h2>&#25991;&#20214;&#32034;&#24341;</h2></div>
+              <div class="file-meta" id="file-meta">
+                <div class="empty">&#36816;&#34892;&#21518;&#26174;&#31034;&#32467;&#26524;&#25991;&#20214;&#12290;</div>
+              </div>
+            </section>
+
+            <section class="stage-card">
+              <div class="toolbar">
+                <h2>&#20998;&#26512;&#20135;&#29289;</h2>
+                <div class="pill"><span class="dot"></span><span>&#36755;&#20986;</span></div>
+              </div>
+              <div id="artifacts">
+                <div class="empty">&#36816;&#34892;&#21518;&#26174;&#31034;&#20998;&#26512;&#20135;&#29289;&#12290;</div>
+              </div>
+            </section>
+          </div>
+        </section>
+
+        <section class="page-view" id="view-config">
+          <div class="config-grid">
+            <section class="card control-card">
+              <div class="control-head">
+                <div>
+                  <p class="eyebrow">API</p>
+                  <h2 class="section-title">API &#37197;&#32622;</h2>
+                </div>
+              </div>
+              <div class="budget-grid">
+                <div class="budget-group">
+                  <h4 class="stage-tag">&#27169;&#22411;&#25509;&#20837;</h4>
+                  <div class="api-provider-tabs" id="llm-provider-tabs" aria-label="API provider">
+                    <button type="button" data-provider="openai">OpenAI</button>
+                    <button type="button" data-provider="anthropic">Anthropic</button>
+                    <button type="button" data-provider="zhipu">Zhipu</button>
+                    <button type="button" data-provider="deepseek">DeepSeek</button>
+                    <button type="button" data-provider="custom">&#20854;&#20182;</button>
+                  </div>
+                  <div class="api-config-fields">
+                    <div>
+                      <label for="llm_base_url">Base URL</label>
+                      <input id="llm_base_url" type="text" autocomplete="off" placeholder="https://api.openai.com/v1">
+                    </div>
+                    <div>
+                      <label for="llm_model">&#27169;&#22411;</label>
+                      <input id="llm_model" type="text" autocomplete="off" placeholder="GPT-5.5">
+                    </div>
+                  </div>
+                  <div class="api-config-fields">
+                    <div>
+                      <label for="llm_api_key">API Key</label>
+                      <input id="llm_api_key" type="password" autocomplete="off" placeholder="&#40664;&#35748;&#20351;&#29992;&#29615;&#22659;&#21464;&#37327;">
+                    </div>
+                    <div>
+                      <label for="llm_temperature">&#28201;&#24230;</label>
+                      <input id="llm_temperature" type="number" step="0.1" min="0" max="2">
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </section>
+
+            <section class="card control-card">
+              <div class="control-head">
+                <div>
+                  <p class="eyebrow">&#20248;&#21270;</p>
+                  <h2 class="section-title">&#31639;&#27861;&#24341;&#25806;&#37197;&#32622;</h2>
+                </div>
+              </div>
+              <div class="budget-grid">
+                <div class="budget-group">
+                  <h4 class="stage-tag">&#35838;&#31243;&#23398;&#20064;</h4>
+                  <div class="triple stage-group">
+                    <div>
+                      <label for="iterations">&#36845;&#20195;&#36718;&#25968;</label>
+                      <input id="iterations" type="number" step="1" min="1" value="3000">
+                    </div>
+                    <div>
+                      <label for="spp">&#37319;&#26679;&#25968;</label>
+                      <input id="spp" type="number" step="1" min="1">
+                    </div>
+                    <div>
+                      <label for="test_per_iter">&#27979;&#35797;&#38388;&#38548;</label>
+                      <input id="test_per_iter" type="number" step="1" min="1">
+                    </div>
+                  </div>
+                  <div class="triple stage-group">
+                    <div>
+                      <label for="curriculum_num_ring">&#20809;&#32447;&#29615;&#25968;</label>
+                      <input id="curriculum_num_ring" type="number" step="1" min="1">
+                    </div>
+                    <div>
+                      <label for="curriculum_num_arm">&#20809;&#32447;&#33218;&#25968;</label>
+                      <input id="curriculum_num_arm" type="number" step="1" min="1">
+                    </div>
+                  </div>
+                </div>
+
+                <div class="budget-group">
+                  <h4 class="stage-tag">&#24494;&#35843;</h4>
+                  <div class="triple stage-group">
+                    <div>
+                      <label for="fine_tune_iterations">&#24494;&#35843;&#36718;&#27425;</label>
+                      <input id="fine_tune_iterations" type="number" step="1" min="1" value="2000">
+                    </div>
+                    <div>
+                      <label for="fine_tune_spp">&#37319;&#26679;&#25968;</label>
+                      <input id="fine_tune_spp" type="number" step="1" min="1">
+                    </div>
+                    <div>
+                      <label for="fine_tune_test_per_iter">&#27979;&#35797;&#38388;&#38548;</label>
+                      <input id="fine_tune_test_per_iter" type="number" step="1" min="1">
+                    </div>
+                  </div>
+                  <div class="triple stage-group">
+                    <div>
+                      <label for="fine_tune_num_ring">&#20809;&#32447;&#29615;&#25968;</label>
+                      <input id="fine_tune_num_ring" type="number" step="1" min="1">
+                    </div>
+                    <div>
+                      <label for="fine_tune_num_arm">&#20809;&#32447;&#33218;&#25968;</label>
+                      <input id="fine_tune_num_arm" type="number" step="1" min="1">
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </section>
+          </div>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <script>window.LENSBOT_DEFAULTS = __DEFAULTS__;</script>
+  <script src="/ui/dashboard.js"></script>
+</body>
+</html>

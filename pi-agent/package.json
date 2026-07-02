@@ -1,0 +1,12 @@
+{
+  "name": "@lensbot/pi-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "opti:pi-sidecar": "node src/pi-sidecar.ts"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}

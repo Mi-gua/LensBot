@@ -9,6 +9,12 @@ from itertools import islice
 from pathlib import Path
 from typing import Any, Callable
 
+
+MTF_FULL_MAX_FREQUENCY_CY_MM = 50.0
+MTF_DIAGNOSTIC_MIN_XMAX_CY_MM = 15.0
+MTF_DIAGNOSTIC_MTF50_SCALE = 2.5
+
+
 class PythonStandaloneApplication:
     class LicenseException(Exception):
         pass
@@ -168,14 +174,14 @@ def _extract_frequency_axis_metadata(analysis: Any, results: Any) -> dict[str, s
     }
 
 
-def _clean_field_label_for_legend(field_label: str, fallback_index: int) -> str:
+def _clean_field_label_for_legend(field_label: str, field_index: int) -> str:
     text = field_label.strip()
     if not text:
-        return f"Field {fallback_index + 1}"
+        return f"Field {field_index + 1}"
 
     match = re.search(r"[-+]?\d+(?:\.\d+)?", text)
     if match:
-        return f"Field {fallback_index + 1} ({match.group(0)})"
+        return f"Field {field_index + 1} ({match.group(0)})"
 
     return text
 
@@ -329,7 +335,7 @@ def get_system_metrics(
     fnum_source = "zemax_operand"
     if fnum is None:
         fnum = _reasonable_fnum(sidecar.get("fnum"))
-        fnum_source = "deeplens_sidecar" if fnum is not None else "fallback"
+        fnum_source = "deeplens_sidecar" if fnum is not None else "unavailable"
     if fnum is None and efl:
         aperture_value = _safe_getattr(system.SystemData.Aperture, "ApertureValue")
         try:
@@ -436,7 +442,7 @@ def get_fft_mtf_metrics(zos: PythonStandaloneApplication, system: Any) -> list[d
     analysis = system.Analyses.New_FftMtf()
     try:
         settings = analysis.GetSettings()
-        settings.MaximumFrequency = 50
+        settings.MaximumFrequency = MTF_FULL_MAX_FREQUENCY_CY_MM
         settings.SampleSize = zos.ZOSAPI.Analysis.SampleSizes.S_256x256
 
         analysis.ApplyAndWaitForCompletion()
@@ -704,13 +710,12 @@ def _format_number(value: Any, unit: str | None = None) -> str:
     return f"{number:.6g}{suffix}"
 
 
-def _suggest_mtf_xmax(mtf_series: list[dict[str, Any]]) -> float | None:
+def _finite_positive_frequencies(mtf_series: list[dict[str, Any]]) -> list[float]:
     finite_freqs: list[float] = []
-    informative_freqs: list[float] = []
 
     for series in mtf_series:
         freqs = series.get("frequency_values") or series.get("frequency_cycles_per_mm") or []
-        for index, raw_freq in enumerate(freqs):
+        for raw_freq in freqs:
             try:
                 freq = float(raw_freq)
             except (TypeError, ValueError):
@@ -719,28 +724,102 @@ def _suggest_mtf_xmax(mtf_series: list[dict[str, Any]]) -> float | None:
                 continue
             finite_freqs.append(freq)
 
-            values = []
-            for key in ("tangential", "sagittal"):
-                raw_values = series.get(key) or []
-                if index < len(raw_values):
-                    try:
-                        values.append(float(raw_values[index]))
-                    except (TypeError, ValueError):
-                        pass
-            if any(math.isfinite(value) and value >= 0.05 for value in values):
-                informative_freqs.append(freq)
+    return finite_freqs
+
+
+def _finite_mtf50_values(
+    mtf_series: list[dict[str, Any]],
+    mtf_summary: dict[str, Any] | None = None,
+) -> list[float]:
+    values: list[float] = []
+    summary_series = []
+    if isinstance(mtf_summary, dict):
+        raw_summary_series = mtf_summary.get("series")
+        if isinstance(raw_summary_series, list):
+            summary_series = raw_summary_series
+
+    for series_summary in summary_series:
+        if not isinstance(series_summary, dict):
+            continue
+        for key in ("mtf50_tangential", "mtf50_sagittal"):
+            try:
+                value = float(series_summary.get(key))
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value) and value > 0:
+                values.append(value)
+
+    if values:
+        return values
+
+    for series in mtf_series:
+        freqs = [float(value) for value in series.get("frequency_values", [])]
+        for key in ("tangential", "sagittal"):
+            mtf_values = [float(value) for value in series.get(key, [])]
+            value = _mtf50(freqs, mtf_values)
+            if value is not None and math.isfinite(value) and value > 0:
+                values.append(value)
+
+    return values
+
+
+def _suggest_mtf_diagnostic_xmax(
+    mtf_series: list[dict[str, Any]],
+    mtf_summary: dict[str, Any] | None = None,
+) -> float | None:
+    finite_freqs = _finite_positive_frequencies(mtf_series)
 
     if not finite_freqs:
         return None
 
     raw_max = max(finite_freqs)
-    if raw_max <= 50:
-        return raw_max
+    mtf50_values = _finite_mtf50_values(mtf_series, mtf_summary)
+    if mtf50_values:
+        diagnostic_xmax = max(MTF_DIAGNOSTIC_MIN_XMAX_CY_MM, MTF_DIAGNOSTIC_MTF50_SCALE * max(mtf50_values))
+        return min(raw_max, diagnostic_xmax)
 
-    if informative_freqs:
-        return min(raw_max, max(20.0, min(50.0, max(informative_freqs) * 1.1)))
+    return min(raw_max, MTF_FULL_MAX_FREQUENCY_CY_MM)
 
-    return min(raw_max, 50.0)
+
+def _suggest_mtf_full_xmax(mtf_series: list[dict[str, Any]]) -> float:
+    finite_freqs = _finite_positive_frequencies(mtf_series)
+    if not finite_freqs:
+        return MTF_FULL_MAX_FREQUENCY_CY_MM
+    return min(max(finite_freqs), MTF_FULL_MAX_FREQUENCY_CY_MM)
+
+
+def _plot_mtf_series(
+    plt: Any,
+    report: dict[str, Any],
+    *,
+    xlim_right: float | None,
+    title: str,
+) -> None:
+    colors = ("tab:blue", "tab:orange", "tab:green", "tab:red", "tab:purple")
+    mtf_series = report.get("fft_mtf", [])
+    axis_label = "Spatial frequency"
+    if mtf_series:
+        axis_label = str(mtf_series[0].get("frequency_axis_label") or axis_label)
+    if "cy/mm" not in axis_label and "cycles" not in axis_label.lower():
+        axis_label = f"{axis_label} (cy/mm)"
+
+    for series in mtf_series:
+        idx = int(series["series_index"])
+        color = colors[idx % len(colors)]
+        label = _clean_field_label_for_legend(str(series.get("field_label", "")), idx)
+        freq = series.get("frequency_values") or series.get("frequency_cycles_per_mm") or []
+        plt.plot(freq, series["tangential"], color=color, label=f"{label} T")
+        plt.plot(freq, series["sagittal"], color=color, linestyle="--", label=f"{label} S")
+
+    plt.title(title)
+    plt.xlabel(axis_label)
+    plt.ylabel("MTF")
+    plt.ylim(bottom=0)
+    if xlim_right is not None and xlim_right > 0:
+        plt.xlim(left=0, right=xlim_right)
+    plt.grid(True, alpha=0.3)
+    plt.legend(fontsize=8)
+    plt.tight_layout()
 
 
 def plot_report(
@@ -762,35 +841,23 @@ def plot_report(
 
     figures: list[dict[str, str]] = []
 
+    mtf_series = report.get("fft_mtf", [])
+
     mtf_path = output_root / "fft_mtf.png"
     plt.figure(figsize=(10, 6))
-    colors = ("tab:blue", "tab:orange", "tab:green", "tab:red", "tab:purple")
-    mtf_series = report.get("fft_mtf", [])
-    axis_label = "Spatial frequency"
-    if mtf_series:
-        axis_label = str(mtf_series[0].get("frequency_axis_label") or axis_label)
-    if "cy/mm" not in axis_label and "cycles" not in axis_label.lower():
-        axis_label = f"{axis_label} (cy/mm)"
-    for series in report.get("fft_mtf", []):
-        idx = int(series["series_index"])
-        color = colors[idx % len(colors)]
-        label = _clean_field_label_for_legend(str(series.get("field_label", "")), idx)
-        freq = series.get("frequency_values") or series.get("frequency_cycles_per_mm") or []
-        plt.plot(freq, series["tangential"], color=color, label=f"{label} T")
-        plt.plot(freq, series["sagittal"], color=color, linestyle="--", label=f"{label} S")
-
-    plt.title("FFT MTF")
-    plt.xlabel(axis_label)
-    plt.ylabel("MTF")
-    plt.ylim(bottom=0)
-    mtf_xmax = _suggest_mtf_xmax(mtf_series)
-    if mtf_xmax is not None and mtf_xmax > 0:
-        plt.xlim(left=0, right=mtf_xmax)
-    plt.grid(True, alpha=0.3)
-    plt.legend(fontsize=8)
+    mtf_xmax = _suggest_mtf_diagnostic_xmax(mtf_series, report.get("mtf_summary"))
+    _plot_mtf_series(plt, report, xlim_right=mtf_xmax, title="FFT MTF diagnostic")
     plt.tight_layout()
     plt.savefig(mtf_path, dpi=180)
     plt.close()
+
+    mtf_full_path = output_root / "fft_mtf_full.png"
+    plt.figure(figsize=(10, 6))
+    _plot_mtf_series(plt, report, xlim_right=_suggest_mtf_full_xmax(mtf_series), title="FFT MTF full range")
+    plt.tight_layout()
+    plt.savefig(mtf_full_path, dpi=180)
+    plt.close()
+
     figures.append({"key": "fft_mtf", "title": "FFT MTF", "path": str(mtf_path)})
 
     field_numbers = sorted({int(item["field"]) for item in report.get("spot_metrics", [])})
@@ -911,13 +978,23 @@ class ZemaxAnalysisEngine:
         progress_cb: Callable[[str], None] | None = None,
     ) -> dict[str, Any]:
         if not final_zmx:
-            return {"ok": False, "error": "No final.zmx path was provided."}
+            return {
+                "ok": False,
+                "status": "skipped",
+                "final_zmx": None,
+                "error": "No final.zmx path was provided.",
+            }
 
         lens_file = Path(final_zmx).resolve()
         if not lens_file.exists():
-            return {"ok": False, "error": f"Lens file not found: {lens_file}"}
+            return {
+                "ok": False,
+                "status": "skipped",
+                "final_zmx": str(lens_file),
+                "error": f"Lens file not found: {lens_file}",
+            }
 
-        output_dir = Path(result_dir).resolve() / "zemax-analysis" if result_dir else lens_file.parent / "zemax-analysis"
+        output_dir = Path(result_dir).resolve() / "verification" / "zemax" if result_dir else lens_file.parent / "verification" / "zemax"
         output_dir.mkdir(parents=True, exist_ok=True)
 
         def emit(message: str) -> None:
@@ -928,7 +1005,13 @@ class ZemaxAnalysisEngine:
         try:
             zos = PythonStandaloneApplication()
         except Exception as exc:
-            return {"ok": False, "lens_file": str(lens_file), "error": str(exc)}
+            return {
+                "ok": False,
+                "status": "unavailable",
+                "final_zmx": str(lens_file),
+                "lens_file": str(lens_file),
+                "error": str(exc),
+            }
 
         try:
             system = zos.TheSystem
@@ -937,6 +1020,8 @@ class ZemaxAnalysisEngine:
             emit("Zemax 分析：执行 FFT MTF 与 Spot 分析。")
             report: dict[str, Any] = {
                 "ok": True,
+                "status": "complete",
+                "final_zmx": str(lens_file),
                 "lens_file": str(lens_file),
                 "lens_unit": str(system.SystemData.Units.LensUnits),
                 "spot_unit": "um",
@@ -971,6 +1056,12 @@ class ZemaxAnalysisEngine:
             emit("Zemax 分析：结果和图像已归档。")
             return report
         except Exception as exc:
-            return {"ok": False, "lens_file": str(lens_file), "error": str(exc)}
+            return {
+                "ok": False,
+                "status": "failed",
+                "final_zmx": str(lens_file),
+                "lens_file": str(lens_file),
+                "error": str(exc),
+            }
         finally:
             del zos

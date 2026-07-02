@@ -5,24 +5,28 @@ from dataclasses import asdict, is_dataclass
 from textwrap import dedent
 from typing import Any
 
+from subagents.types import public_params_dict
+
 
 OPTICAL_DESIGN_PRINCIPLES = dedent(
     """
     You are working on practical optical lens design, not generic text planning.
-    Preserve explicit user targets for effective focal length, field of view, F-number,
-    back focal length, total track length, and sensor/image height. Treat large drift
-    in EFL, FOV, or F-number as a design failure even if spot metrics improve.
-    Keep the design path compatible with DeepLens initialization and downstream Zemax
-    evaluation. Prefer a stable, optimizable starting structure over a mechanically
-    copied patent or catalog prescription.
+    Preserve user-specified effective focal length, field of view, F-number, back
+    focal length, total track length, and image/sensor scale targets.
+    Treat large EFL, FOV, or F-number drift as a design failure even when spot
+    metrics improve.
+    The design path must remain compatible with DeepLens initialization and later
+    independent Zemax evaluation.
+    Prefer stable, optimizable starting structures over mechanically copying a
+    patent or catalog prescription.
     """
 ).strip()
 
 
 WORKFLOW_AGENT_PROMPTS = {
-    "intake_agent": dedent(
+    "Intake": dedent(
         """
-        You are LensBot's IntakeAgent.
+        You are LensBot's Intake.
         Your responsibility is to convert the user's request into explicit, executable
         optical design targets and an optimization budget.
 
@@ -54,9 +58,10 @@ WORKFLOW_AGENT_PROMPTS = {
           otherwise.
         """
     ).strip(),
-    "seed_design_agent": dedent(
+
+    "Seeding": dedent(
         """
-        You are LensBot's SeedDesignAgent.
+        You are LensBot's Seeding.
         Your responsibility is to choose and validate an initial optical structure
         that DeepLens can optimize.
 
@@ -79,20 +84,28 @@ WORKFLOW_AGENT_PROMPTS = {
         - The next agent should receive parameters and references that explain what
           seed was selected and whether it was applied.
 
+        Memory:
+        - Before choosing, use both seed_selection.md and final_review.md experience
+          from engineering_experience.
+        - After this phase, the workflow updates seed_selection.md with durable
+          structure-selection lessons. Keep those lessons short and general, such as
+          "Double Gauss 类结构对中等 FOV、标准焦段更稳，但后组 asphere 可优化自由度更关键。"
+
         Structured outputs:
-        - For case selection, return exactly one JSON object and no Markdown or
-          explanation. Allowed fields: case_id, rationale. case_id must come from the
-          supplied ZEMAX index and should look like L_014.
+        - For candidate screening, return exactly one JSON object and no Markdown.
+          Allowed fields: candidate_ids, rationale. candidate_ids must be a short
+          list of supplied candidate_id values such as ["seed_001", "seed_003"].
         - For DeepLens initialization, return exactly one JSON object and no Markdown
-          or explanation. Allowed top-level fields: case_id, deeplens_args,
-          curriculum, fine_tune, rationale.
+          or explanation. In batch mode, allowed top-level fields are
+          preferred_case_id, rationale, initial_structures. initial_structures must
+          contain exactly one item for each supplied selected case.
+        - Each initial_structures item may contain only: candidate_id, case_id,
+          deeplens_args, curriculum, fine_tune, rationale, risks.
         - deeplens_args may contain only: foclen, fov, fnum, bfl, thickness, surf_list.
-        - curriculum may contain only: lrs, iterations, test_per_iter, optim_mat,
-          match_mat, shape_control, num_ring, num_arm, spp, scale_pupil,
-          aper_start_ratio, weight_dropout, w_focus, w_reg.
-        - fine_tune may contain only: lrs, iterations, test_per_iter, centroid,
-          optim_mat, shape_control, num_ring, num_arm, spp, scale_pupil,
-          weight_dropout, w_focus, w_reg, num_warmup_steps.
+        - curriculum may contain only: iterations, test_per_iter, num_ring,
+          num_arm, spp.
+        - fine_tune may contain only: iterations, test_per_iter, num_ring,
+          num_arm, spp.
         - surf_list is a list of surface groups. Each lens group may contain only 2
           or 3 surfaces. The aperture must be its own group: ["Aperture"].
         - Valid examples: ["Spheric","Spheric"], ["Spheric","Spheric","Spheric"],
@@ -101,33 +114,10 @@ WORKFLOW_AGENT_PROMPTS = {
           than 3.
         """
     ).strip(),
-    "optimization_agent": dedent(
-        """
-        You are LensBot's OptimizationAgent.
-        Your responsibility is to run the DeepLens optimization engine and produce
-        baseline artifacts and internal metrics for downstream performance analysis.
 
-        Scope:
-        - Run the configured DeepLens optimization before evaluating results.
-        - Evaluate DeepLens metrics from generated artifacts.
-        - Preserve result paths for final.json, final.zmx, final.png, logs, and
-          iteration artifacts.
-        - Publish artifacts so the dashboard can inspect optimization progress.
-
-        Boundaries:
-        - Do not rewrite the user's target to make the result look better.
-        - Do not run Zemax or external performance analysis.
-        - Do not make the final acceptance decision.
-        - Do not archive final memory; leave that to the reporting agent.
-
-        Handoff:
-        - The performance analysis agent should receive result paths and DeepLens
-          metrics sufficient for independent validation and acceptance checks.
+    "Analysis": dedent(
         """
-    ).strip(),
-    "performance_analysis_agent": dedent(
-        """
-        You are LensBot's AnalysisAgent.
+        You are LensBot's Analysis.
         Your responsibility is to independently analyze the optimized lens performance
         and decide whether the result satisfies the user's optical targets.
 
@@ -148,55 +138,68 @@ WORKFLOW_AGENT_PROMPTS = {
         Handoff:
         - The reporting agent should receive merged metrics, Zemax artifacts,
           acceptance status, and concrete issues if the design is not acceptable.
+
+        Memory:
+        - Do not write the final review memory in this node. The workflow writes
+          final_review.md after analysis artifacts and the run report have been
+          archived, so the lesson can summarize the whole optimization rather than
+          only the Zemax tool output.
         """
     ).strip(),
-    "report_memory_agent": dedent(
+    
+    "Reporting": dedent(
         """
-        You are LensBot's ReportMemoryAgent.
-        Your responsibility is to archive the run and update reusable optical design
-        memory.
+        You are LensBot's Reporting.
+        Your responsibility is to archive the run after the phase-specific agents
+        have updated reusable optical design experience.
 
         Scope:
         - Write a compact report covering the user target, reference source,
           optimized artifacts, key metrics, acceptance result, and known issues.
-        - Record durable engineering lessons only when they can guide future optical
-          design decisions.
-        - Prefer lessons about structure choice, constraints, optimization strategy,
-          failure signals, and parameter heuristics.
+        - Preserve enough run-level evidence for later debugging and audit.
+        - Keep durable engineering lessons in the phase-specific Markdown memories:
+          seed selection, optimization, and Zemax analysis.
 
         Boundaries:
-        - Do not record one-off observations as reusable knowledge.
         - Do not hide failure states or evaluator issues.
         - Do not rerun optimization or change metrics.
+        - Do not write additional JSON engineering lessons.
 
         Handoff:
-        - The workflow should finish with archived files, metrics, summary report, and
-          optional reusable memory updates.
+        - The workflow should finish with archived files, metrics, and summary report.
 
-        Structured outputs:
-        - When extracting reusable engineering lessons, return exactly one JSON object
-          and no Markdown or explanation.
-        - Use should_record=false and action="skip" when nothing durable should be
-          saved.
-        - For related knowledge, use action="update" and reuse an existing topic_key;
-          otherwise use action="create".
-        - Allowed fields: should_record, action, topic_key, title, category, lesson,
-          applicability, signals, guidance, parameter_hints, anti_patterns.
-        - topic_key must be stable short ASCII kebab-case.
-        - lesson should be one or two concise sentences.
-        - applicability, signals, guidance, parameter_hints, and anti_patterns must be
-          concise string lists.
+        Memory:
+        - After analysis artifacts and the run report are archived, the workflow
+          updates final_review.md with general post-run optical design lessons.
+        - These lessons should be useful before future seed selection and optimization;
+          do not write them as a Zemax analysis summary.
         """
     ).strip(),
 }
 
 
-def workflow_agent_prompt(agent_name: str) -> str:
+def workflow_agent_prompt(
+    agent_name: str,
+    *,
+    objective: str = "",
+    available_tools: list[str] | None = None,
+    context: dict[str, Any] | None = None,
+) -> str:
     """Return the role prompt for a workflow subagent."""
     role_prompt = WORKFLOW_AGENT_PROMPTS.get(agent_name, "").strip()
-    if not role_prompt:
-        return OPTICAL_DESIGN_PRINCIPLES
-    return f"{OPTICAL_DESIGN_PRINCIPLES}\n\n{role_prompt}"
+    prompt_parts = [OPTICAL_DESIGN_PRINCIPLES]
+    if role_prompt:
+        prompt_parts.append(role_prompt)
+
+    runtime_prompt = _runtime_prompt(
+        objective=objective,
+        available_tools=available_tools,
+        context=context,
+    )
+    if runtime_prompt:
+        prompt_parts.append(runtime_prompt)
+
+    return "\n\n".join(part for part in prompt_parts if part)
 
 
 def workflow_agent_context(
@@ -209,12 +212,15 @@ def workflow_agent_context(
     metrics: dict[str, Any] | None = None,
     issues: list[str] | None = None,
 ) -> dict[str, Any]:
+    memory = memory or {}
+    domain_lessons = _domain_lessons(agent_name, memory)
     return {
         "agent": agent_name,
         "objective": objective,
-        "current_task": (memory or {}).get("current_task"),
-        "relevant_engineering_lessons": (memory or {}).get("relevant_engineering_lessons", []),
-        "recent_design_runs": (memory or {}).get("recent_design_runs", []),
+        "current_task": memory.get("current_task"),
+        "engineering_experience": domain_lessons,
+        "relevant_engineering_lessons": memory.get("relevant_engineering_lessons", []),
+        "recent_design_runs": memory.get("recent_design_runs", []),
         "effective_target": _jsonable(params),
         "references": references or [],
         "metrics": _compact_metrics(metrics or {}),
@@ -222,13 +228,27 @@ def workflow_agent_context(
     }
 
 
-def json_context(value: Any) -> str:
-    return json.dumps(_jsonable(value), ensure_ascii=False, indent=2)
+def _domain_lessons(agent_name: str, memory: dict[str, Any]) -> dict[str, str]:
+    if agent_name == "Seeding":
+        return {
+            "seed_selection": str(memory.get("seed_selection_lessons") or ""),
+            "final_review": str(memory.get("final_review_lessons") or ""),
+        }
+    if agent_name == "Optimization":
+        return {
+            "optimization": str(memory.get("optimization_lessons") or ""),
+            "final_review": str(memory.get("final_review_lessons") or ""),
+        }
+    if agent_name == "Analysis":
+        return {}
+    return {}
 
 
 def _jsonable(value: Any) -> Any:
     if value is None:
         return None
+    if _looks_like_lens_params(value):
+        return public_params_dict(value)
     if is_dataclass(value):
         return asdict(value)
     if isinstance(value, dict):
@@ -238,6 +258,10 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, tuple):
         return [_jsonable(item) for item in value]
     return value
+
+
+def _looks_like_lens_params(value: Any) -> bool:
+    return all(hasattr(value, key) for key in ("foclen", "fov", "fnum", "curriculum", "fine_tune"))
 
 
 def _compact_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
@@ -258,3 +282,42 @@ def _compact_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
         "acceptance",
     ]
     return {key: metrics.get(key) for key in keys if key in metrics}
+
+
+def _runtime_prompt(
+    *,
+    objective: str,
+    available_tools: list[str] | None,
+    context: dict[str, Any] | None,
+) -> str:
+    parts: list[str] = []
+    if objective:
+        parts.append(f"Current objective: {objective}")
+    if available_tools:
+        parts.append("Available tools: " + ", ".join(available_tools))
+    if context:
+        parts.append("Runtime context JSON:\n" + _format_runtime_context_json(context))
+    if not parts:
+        return ""
+    return "Runtime prompt:\n" + "\n\n".join(parts)
+
+
+def _format_runtime_context_json(context: dict[str, Any] | None) -> str:
+    compacted = _compact_prompt_context(context)
+    if not compacted:
+        return "{}"
+    return json.dumps(compacted, ensure_ascii=False, indent=2)
+
+
+def _compact_prompt_context(context: dict[str, Any] | None) -> dict[str, Any]:
+    data = dict(context or {})
+    for key, limit in (
+        ("relevant_engineering_lessons", 4),
+        ("recent_design_runs", 2),
+        ("references", 3),
+        ("issues", 5),
+    ):
+        value = data.get(key)
+        if isinstance(value, list):
+            data[key] = value[:limit]
+    return data

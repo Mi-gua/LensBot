@@ -11,7 +11,10 @@ def analyze_deeplens_final(final_json: str | Path) -> dict[str, Any]:
 
     final_json = Path(final_json)
     ensure_deeplens_import(Path(__file__))
-    from deeplens.optics import GeoLens
+    try:
+        from deeplens.optics import GeoLens
+    except ModuleNotFoundError:
+        from deeplens import GeoLens
 
     lens = GeoLens(filename=str(final_json))
     efl_mm = float(lens.foclen)
@@ -26,6 +29,7 @@ def analyze_deeplens_final(final_json: str | Path) -> dict[str, Any]:
         "deeplens_efl_mm": efl_mm,
         "deeplens_fnum": float(lens.fnum),
         "deeplens_fov_deg": fov_deg,
+        "rfov_deg": float(np.rad2deg(rfov_rad)),
         "spot_rms_um_center": float(spot.get("fov0.0", {}).get("rms", np.nan)),
         "spot_rms_um_mid": float(spot.get("fov0.5", {}).get("rms", np.nan)),
         "spot_rms_um_edge": float(spot.get("fov1.0", {}).get("rms", np.nan)),

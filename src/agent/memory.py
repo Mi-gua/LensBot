@@ -2,13 +2,61 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from agent.llm import OpenAIExtractor
 from agent.settings import AgentInput, AgentResult
+from subagents.types import public_params_dict
+
+
+LESSON_DOMAINS = {
+    "seed_selection": "初始结构选择经验",
+    "optimization": "DeepLens 优化经验",
+    "final_review": "整体验证与通用镜头经验",
+}
+
+
+def run_memory_update(
+    runtime: Any,
+    ctx: Any,
+    *,
+    label: str,
+    update: Callable[[], None],
+) -> bool:
+    try:
+        update()
+    except BaseException as exc:  # pragma: no cover - defensive boundary
+        _emit_memory_skip(runtime, ctx, exc)
+        return False
+    return True
+
+
+def _emit_memory_skip(runtime: Any, ctx: Any, error: Any) -> None:
+    emit = getattr(runtime, "emit_event", None)
+    if callable(emit):
+        emit(ctx, "workflow.memory.skipped", error=error)
+
+
+def _raw_markdown_response(value: Any) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].strip().startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    if _looks_like_lesson_markdown(text):
+        return text
+    return None
+
+
+def _looks_like_lesson_markdown(text: str) -> bool:
+    return ("#" in text and "\n-" in text) or text.startswith("- ")
 
 
 class AgentMemory:
@@ -16,10 +64,10 @@ class AgentMemory:
         self.root = root
         self.design_runs_dir = root / "designrun"
         self.project_memory_file = root / "project.md"
-        self.engineering_lessons_index = root / "lessons.json"
+        self.lessons_dir = root / "lessons"
         self.root.mkdir(parents=True, exist_ok=True)
         self._ensure_project_memory()
-        self._ensure_lessons_store()
+        self._ensure_markdown_lesson_files()
         self.extractor = OpenAIExtractor()
 
     def create_snapshot(self, request: AgentInput | None = None, params: Any | None = None) -> dict[str, Any]:
@@ -28,8 +76,9 @@ class AgentMemory:
             "project_memory": self.load_project_memory(),
             "current_task": self._task_memory(request, params),
             "recent_design_runs": self.load_recent_design_runs(limit=3, compact=True),
-            "relevant_engineering_lessons": self.load_relevant_lessons(request, params, limit=6),
-            "recent_engineering_lessons": self.load_recent_lessons(limit=3),
+            "seed_selection_lessons": self.load_markdown_lessons("seed_selection"),
+            "optimization_lessons": self.load_markdown_lessons("optimization"),
+            "final_review_lessons": self.load_markdown_lessons("final_review"),
         }
 
     def refresh_task_context(
@@ -39,7 +88,9 @@ class AgentMemory:
         params: Any | None,
     ) -> None:
         snapshot["current_task"] = self._task_memory(request, params)
-        snapshot["relevant_engineering_lessons"] = self.load_relevant_lessons(request, params, limit=6)
+        snapshot["seed_selection_lessons"] = self.load_markdown_lessons("seed_selection")
+        snapshot["optimization_lessons"] = self.load_markdown_lessons("optimization")
+        snapshot["final_review_lessons"] = self.load_markdown_lessons("final_review")
 
     @staticmethod
     def _read_json_files(path: Path) -> list[dict[str, Any]]:
@@ -72,7 +123,7 @@ class AgentMemory:
                     "",
                     "## Role",
                     "",
-                    "- Design and optimize optical lens systems with workflow-level planning and node-level agent loops.",
+                    "- Design and optimize optical lens systems with workflow-level planning and pi-backed optimization control.",
                     "",
                     "## Tool Boundaries",
                     "",
@@ -96,6 +147,101 @@ class AgentMemory:
             return self.project_memory_file.read_text(encoding="utf-8").strip()
         except OSError:
             return ""
+
+    def load_markdown_lessons(self, domain: str) -> str:
+        path = self._markdown_lesson_path(domain)
+        try:
+            return path.read_text(encoding="utf-8").strip()
+        except OSError:
+            return ""
+
+    def record_seed_selection_lessons(
+        self,
+        *,
+        request: AgentInput,
+        params: Any | None,
+        references: list[dict[str, Any]],
+        seed_candidates: list[Any],
+    ) -> None:
+        context = {
+            "request": {"mode": request.mode, "prompt": request.prompt},
+            "target": self._target_summary(params),
+            "selected_references": [item for item in references if item.get("selected")][:3],
+            "references": references[:8],
+            "seed_candidates": [self._candidate_memory(item) for item in seed_candidates[:8]],
+        }
+        self._rewrite_markdown_lessons(
+            domain="seed_selection",
+            context=context,
+            instruction=(
+                "Update durable seed-selection experience. Keep lessons as short Markdown bullets "
+                "about lens family choice, native first-order proximity, stop placement, surface "
+                "complexity, and DeepLens-compatible starting structures."
+            ),
+        )
+
+    def record_optimization_lessons(
+        self,
+        *,
+        request: AgentInput,
+        params: Any | None,
+        seed_candidates: list[Any],
+        design_result: dict[str, Any],
+        metrics: dict[str, Any],
+        agent_trace: list[dict[str, Any]],
+    ) -> None:
+        context = {
+            "request": {"mode": request.mode, "prompt": request.prompt},
+            "target": self._target_summary(params),
+            "seed_candidates": [self._candidate_memory(item) for item in seed_candidates[:6]],
+            "design_result": self._artifact_presence(design_result),
+            "metrics": self._compact_metrics(metrics),
+            "optimization_trace_tail": self._compact_trace(agent_trace, limit=24),
+        }
+        self._rewrite_markdown_lessons(
+            domain="optimization",
+            context=context,
+            instruction=(
+                "Update durable DeepLens optimization experience. Focus on seed characteristics, metric drift, "
+                "continue/stop/retry signals, strategy-tool choices, budget choices, and visible tool failures. "
+                "Do not recommend hidden optimizer internals, loss constants, or schedules that are not exposed "
+                "to the workflow."
+            ),
+        )
+
+    def record_final_review_lessons(
+        self,
+        *,
+        request: AgentInput,
+        params: Any | None,
+        result: AgentResult,
+        metrics: dict[str, Any],
+        references: list[dict[str, Any]],
+        accepted: bool,
+        issues: list[str],
+    ) -> None:
+        context = {
+            "request": {"mode": request.mode, "prompt": request.prompt},
+            "target": self._target_summary(params),
+            "run_summary": result.summary,
+            "artifacts": self._result_artifact_presence(result),
+            "references": references[:5],
+            "accepted": accepted,
+            "issues": issues,
+            "metrics": self._compact_metrics(metrics),
+            "final_structure": self._surface_summary(self._safe_read_json(result.final_json)),
+        }
+        self._rewrite_markdown_lessons(
+            domain="final_review",
+            context=context,
+            instruction=(
+                "Update durable post-run optical design experience. Extract general lessons from the whole "
+                "completed workflow after final analysis and report archival: seed choice, optimization behavior, "
+                "DeepLens-only evidence, Zemax-verified evidence, Zemax-unavailable caveats, lens-type "
+                "characteristics, and final acceptance failures. This is not a Zemax report summary; write broad "
+                "guidance useful before future seed selection and optimization."
+            ),
+        )
 
     @staticmethod
     def _make_entry_id(result: AgentResult) -> str:
@@ -145,6 +291,27 @@ class AgentMemory:
             "summary_report_file": result.summary_report_file,
             "log_file": result.log_file,
             "metrics_file": result.metrics_file,
+        }
+
+    @staticmethod
+    def _artifact_presence(design_result: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "has_result_dir": bool(design_result.get("result_dir")),
+            "has_curriculum_json": bool(design_result.get("curriculum_json")),
+            "has_analysis_json": bool(design_result.get("analysis_json")),
+            "has_final_json": bool(design_result.get("final_json")),
+            "has_final_zmx": bool(design_result.get("final_zmx")),
+        }
+
+    @staticmethod
+    def _result_artifact_presence(result: AgentResult) -> dict[str, Any]:
+        return {
+            "has_result_dir": bool(result.result_dir),
+            "has_curriculum_json": bool(result.curriculum_json),
+            "has_final_json": bool(result.final_json),
+            "has_final_zmx": bool(result.final_zmx),
+            "has_summary_report": bool(result.summary_report_file),
+            "has_metrics_file": bool(result.metrics_file),
         }
 
     def _task_memory(self, request: AgentInput | None, params: Any | None) -> dict[str, Any]:
@@ -224,7 +391,7 @@ class AgentMemory:
         result: AgentResult,
         params: Any | None = None,
     ) -> None:
-        design_params = asdict(params) if params is not None else (asdict(request.params) if request.params else None)
+        design_params = public_params_dict(params) if params is not None else public_params_dict(request.params)
         curriculum_json = self._safe_read_json(result.curriculum_json)
         final_json = self._safe_read_json(result.final_json)
         row = {
@@ -252,431 +419,109 @@ class AgentMemory:
         row["entry_id"] = entry_id
         self._write_pretty_json(self.design_runs_dir / f"{entry_id}.json", row)
 
-    def record_engineering_lesson(
-        self,
-        request: AgentInput,
-        result: AgentResult,
-        params: Any | None = None,
-        *,
-        system_prompt: str = "",
-    ) -> None:
-        lesson = self._summarize_engineering_lesson(request, result, params=params, system_prompt=system_prompt)
-        if not lesson:
-            logging.warning("Engineering lesson was not written because LLM summarization failed.")
-            return
-        self._upsert_engineering_lesson(lesson, result=result)
-
     def load_recent_design_runs(self, limit: int = 5, *, compact: bool = False) -> list[dict[str, Any]]:
         rows = self._read_json_files(self.design_runs_dir)[-limit:]
         if not compact:
             return rows
         return [self._compact_run_memory(row) for row in rows]
 
-    def load_recent_lessons(self, limit: int = 10) -> list[dict[str, Any]]:
-        library = self._read_lessons_library()
-        entries = sorted(
-            library.get("entries", []),
-            key=lambda item: item.get("updated_at") or item.get("created_at") or "",
-        )
-        recent = entries[-limit:]
-        return [
-            {
-                "title": entry.get("title", ""),
-                "content": self._render_lesson_summary(entry).strip(),
-                "topic_key": entry.get("topic_key", ""),
-                "category": entry.get("category", ""),
-                "revision_count": entry.get("revision_count", 1),
-                "updated_at": entry.get("updated_at"),
-            }
-            for entry in recent
-        ]
-
-    def load_relevant_lessons(
-        self,
-        request: AgentInput | None,
-        params: Any | None,
-        limit: int = 6,
-    ) -> list[dict[str, Any]]:
-        entries = self._read_lessons_library().get("entries", [])
-        if not entries:
-            return []
-
-        query_terms = self._memory_query_terms(request, params)
-        scored: list[tuple[int, str, dict[str, Any]]] = []
-        for entry in entries:
-            text = self._lesson_search_text(entry)
-            score = sum(1 for term in query_terms if term and term in text)
-            score += self._param_relevance_score(entry, params)
-            updated_at = str(entry.get("updated_at") or entry.get("created_at") or "")
-            if score > 0:
-                scored.append((score, updated_at, entry))
-
-        if not scored:
-            recent = sorted(entries, key=lambda item: item.get("updated_at") or item.get("created_at") or "")[-limit:]
-            return [self._compact_lesson_memory(entry) for entry in recent]
-
-        scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
-        return [self._compact_lesson_memory(entry) for _, _, entry in scored[:limit]]
-
-    def _summarize_engineering_lesson(
-        self,
-        request: AgentInput,
-        result: AgentResult,
-        params: Any | None = None,
-        *,
-        system_prompt: str,
-    ) -> dict[str, Any] | None:
-        final_json = self._safe_read_json(result.final_json)
-        existing_lessons = [
-            {
-                "topic_key": entry.get("topic_key"),
-                "title": entry.get("title"),
-                "category": entry.get("category"),
-                "lesson": entry.get("lesson"),
-                "signals": entry.get("signals", []),
-                "guidance": entry.get("guidance", []),
-                "revision_count": entry.get("revision_count", 1),
-            }
-            for entry in self._read_lessons_library().get("entries", [])
-        ]
-        lesson_context = {
-            "task": "extract_reusable_engineering_lesson",
-            "request": {
-                "mode": request.mode,
-                "prompt": request.prompt,
-            },
-            "design_params": asdict(params) if params is not None else (asdict(request.params) if request.params else None),
-            "result": {
-                "ok": result.ok,
-                "summary": result.summary,
-                "metrics": result.metrics,
-                "paths": self._result_paths(result),
-            },
-            "final_structure": self._surface_summary(final_json),
-            "existing_lessons": existing_lessons,
-        }
-        lesson = self.extractor.extract_json(
-            json.dumps(lesson_context, ensure_ascii=False, indent=2),
-            system_prompt,
-        )
-        if isinstance(lesson, dict):
-            return lesson
-        return None
-
-    def _ensure_lessons_store(self) -> None:
-        if self.engineering_lessons_index.exists():
-            return
-
-        entries = self._migrate_legacy_lessons()
-        self._write_lessons_library({"version": 1, "entries": entries})
-
-    def _migrate_legacy_lessons(self) -> list[dict[str, Any]]:
-        legacy_notes = self.root / "lessons" / "notes.md"
-        if not legacy_notes.exists():
-            return []
-
-        lines = legacy_notes.read_text(encoding="utf-8").splitlines()
-        sections: list[list[str]] = []
-        current: list[str] = []
-        for line in lines:
-            if line.startswith("## "):
-                if current:
-                    sections.append(current)
-                current = [line]
-            elif current:
-                current.append(line)
-        if current:
-            sections.append(current)
-
-        migrated: list[dict[str, Any]] = []
-        for idx, section in enumerate(sections, start=1):
-            title_line = section[0][3:].strip()
-            title = title_line.split("|", 1)[-1].strip() if "|" in title_line else title_line
-            lesson_text = self._extract_markdown_section(section, "Lesson")
-            signals = self._extract_markdown_list(section, "Signals")
-            guidance = self._extract_markdown_list(section, "Guidance")
-            topic_key = self._slugify(title) or f"legacy-note-{idx}"
-            migrated.append(
-                {
-                    "id": topic_key,
-                    "topic_key": topic_key,
-                    "title": title or f"Legacy note {idx}",
-                    "category": "legacy",
-                    "lesson": lesson_text or "Legacy lesson migrated from notes.md.",
-                    "applicability": [],
-                    "signals": signals,
-                    "guidance": guidance,
-                    "parameter_hints": [],
-                    "anti_patterns": [],
-                    "source_run_ids": [],
-                    "created_at": datetime.now().isoformat(timespec="seconds"),
-                    "updated_at": datetime.now().isoformat(timespec="seconds"),
-                    "revision_count": 1,
-                }
-            )
-        return migrated
-
-    @staticmethod
-    def _extract_markdown_section(lines: list[str], heading: str) -> str:
-        capture = False
-        content: list[str] = []
-        for line in lines[1:]:
-            if line.startswith("### "):
-                capture = line[4:].strip() == heading
+    def _ensure_markdown_lesson_files(self) -> None:
+        for domain, title in LESSON_DOMAINS.items():
+            path = self._markdown_lesson_path(domain)
+            if path.exists():
                 continue
-            if capture and line.strip():
-                content.append(line.strip())
-        return " ".join(content).strip()
-
-    @staticmethod
-    def _extract_markdown_list(lines: list[str], heading: str) -> list[str]:
-        capture = False
-        content: list[str] = []
-        for line in lines[1:]:
-            if line.startswith("### "):
-                capture = line[4:].strip() == heading
-                continue
-            if capture and line.strip().startswith("- "):
-                content.append(line.strip()[2:].strip())
-        return content
-
-    def _read_lessons_library(self) -> dict[str, Any]:
-        if not self.engineering_lessons_index.exists():
-            return {"version": 1, "entries": []}
-        try:
-            data = json.loads(self.engineering_lessons_index.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return {"version": 1, "entries": []}
-        if not isinstance(data, dict):
-            return {"version": 1, "entries": []}
-        entries = data.get("entries")
-        if not isinstance(entries, list):
-            data["entries"] = []
-        if "version" not in data:
-            data["version"] = 1
-        return data
-
-    def _write_lessons_library(self, row: dict[str, Any]) -> None:
-        self._write_pretty_json(self.engineering_lessons_index, row)
-
-    def _upsert_engineering_lesson(
-        self,
-        lesson: dict[str, Any],
-        *,
-        result: AgentResult | None,
-    ) -> None:
-        normalized = self._normalize_lesson_entry(lesson)
-        if not normalized:
-            return
-        if not normalized["should_record"]:
-            return
-
-        library = self._read_lessons_library()
-        entries = library.get("entries", [])
-        topic_key = normalized["topic_key"]
-        now = datetime.now().isoformat(timespec="seconds")
-        source_ref = self._lesson_source_ref(result)
-
-        existing = next((entry for entry in entries if entry.get("topic_key") == topic_key), None)
-        if existing:
-            existing["title"] = normalized["title"] or existing.get("title", "")
-            existing["category"] = normalized["category"] or existing.get("category", "")
-            existing["lesson"] = normalized["lesson"] or existing.get("lesson", "")
-            for field in ("applicability", "signals", "guidance", "parameter_hints", "anti_patterns"):
-                existing[field] = self._merge_unique_strings(existing.get(field, []), normalized.get(field, []))
-            existing["updated_at"] = now
-            existing["revision_count"] = int(existing.get("revision_count", 1)) + 1
-            existing["source_run_ids"] = self._merge_unique_strings(existing.get("source_run_ids", []), [source_ref] if source_ref else [])
-        else:
-            entries.append(
-                {
-                    "id": topic_key,
-                    "topic_key": topic_key,
-                    "title": normalized["title"],
-                    "category": normalized["category"],
-                    "lesson": normalized["lesson"],
-                    "applicability": normalized["applicability"],
-                    "signals": normalized["signals"],
-                    "guidance": normalized["guidance"],
-                    "parameter_hints": normalized["parameter_hints"],
-                    "anti_patterns": normalized["anti_patterns"],
-                    "source_run_ids": [source_ref] if source_ref else [],
-                    "created_at": now,
-                    "updated_at": now,
-                    "revision_count": 1,
-                }
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                "\n".join(
+                    [
+                        f"# {title}",
+                        "",
+                        "这些条目是跨项目复用的工程经验，不是单次运行日志。",
+                        "请把经验写成短句，保留适用条件，并在新证据出现时修正旧条目。",
+                        "",
+                        "## 经验条目",
+                        "",
+                        "- 暂无稳定经验。",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
             )
 
-        entries.sort(key=lambda item: item.get("updated_at") or item.get("created_at") or "")
-        library["version"] = 1
-        library["entries"] = entries
-        self._write_lessons_library(library)
+    def _markdown_lesson_path(self, domain: str) -> Path:
+        if domain not in LESSON_DOMAINS:
+            raise ValueError(f"Unknown lesson domain: {domain}")
+        return self.lessons_dir / f"{domain}.md"
 
-    @staticmethod
-    def _render_lesson_summary(entry: dict[str, Any]) -> str:
-        title = entry.get("title", "Untitled lesson")
-        lesson = str(entry.get("lesson", "")).strip()
-        signals = AgentMemory._coerce_string_list(entry.get("signals"))[:2]
-        guidance = AgentMemory._coerce_string_list(entry.get("guidance"))[:2]
-
-        lines = [f"{title}: {lesson}"]
-        if signals:
-            lines.append("Signals: " + "; ".join(signals))
-        if guidance:
-            lines.append("Guidance: " + "; ".join(guidance))
-        return "\n".join(lines)
-
-    def _compact_lesson_memory(self, entry: dict[str, Any]) -> dict[str, Any]:
-        return {
-            "topic_key": entry.get("topic_key", ""),
-            "title": entry.get("title", ""),
-            "category": entry.get("category", ""),
-            "lesson": entry.get("lesson", ""),
-            "applicability": self._coerce_string_list(entry.get("applicability"))[:3],
-            "signals": self._coerce_string_list(entry.get("signals"))[:4],
-            "guidance": self._coerce_string_list(entry.get("guidance"))[:4],
-            "parameter_hints": self._coerce_string_list(entry.get("parameter_hints"))[:3],
-            "anti_patterns": self._coerce_string_list(entry.get("anti_patterns"))[:3],
-            "updated_at": entry.get("updated_at"),
-            "revision_count": entry.get("revision_count", 1),
+    def _rewrite_markdown_lessons(self, *, domain: str, context: dict[str, Any], instruction: str) -> None:
+        path = self._markdown_lesson_path(domain)
+        current = self.load_markdown_lessons(domain)
+        payload = {
+            "task": "rewrite_markdown_engineering_lessons",
+            "domain": domain,
+            "domain_title": LESSON_DOMAINS[domain],
+            "rules": [
+                "Return exactly one JSON object with a markdown string field.",
+                "Rewrite the whole Markdown file, preserving useful old lessons and revising them when new evidence contradicts them.",
+                "Keep the file concise: prefer 6-14 bullets total.",
+                "Write lessons as reusable engineering experience, not as one-off project reports.",
+                "Prefer conditional lessons in the form `When ..., prefer/avoid ...` whenever evidence supports a condition.",
+                "Separate confirmed lessons from weak signals; preserve existing lessons when the new evidence is weak.",
+                "Do not include run IDs, artifact paths, timestamps, absolute paths, raw JSON, tables, run logs, or long numeric dumps.",
+                "Use Markdown headings and bullet points only.",
+            ],
+            "current_markdown": current,
+            "new_evidence": context,
         }
-
-    def _memory_query_terms(self, request: AgentInput | None, params: Any | None) -> set[str]:
-        text = " ".join(
+        system_prompt = "\n".join(
             [
-                str(request.prompt or "") if request else "",
-                str(getattr(params, "surf_list", "")),
+                "You maintain LensBot's reusable optical engineering memory.",
+                instruction,
+                "Good style example: Double Gauss 类结构对中等 FOV、标准焦段更稳，但后组 asphere 可优化自由度更关键。",
+                "The Markdown must stay directly useful to the next workflow agent.",
             ]
-        ).lower()
-        terms = {
-            token.strip(" ,.;:()[]{}<>/\\|").lower()
-            for token in text.replace("_", " ").replace("-", " ").split()
-            if len(token.strip(" ,.;:()[]{}<>/\\|")) >= 3
+        )
+        result = self.extractor.extract_json(json.dumps(payload, ensure_ascii=False, indent=2), system_prompt)
+        markdown = result.get("markdown") if isinstance(result, dict) else None
+        if not isinstance(markdown, str) or not markdown.strip():
+            markdown = _raw_markdown_response(getattr(self.extractor, "last_content", ""))
+        if not isinstance(markdown, str) or not markdown.strip():
+            error = str(getattr(self.extractor, "last_error", "") or "").strip()
+            suffix = f": {error}" if error else ""
+            logging.warning("%s lessons were not updated because LLM markdown rewrite failed%s.", domain, suffix)
+            return
+        path.write_text(markdown.strip() + "\n", encoding="utf-8")
+
+    @staticmethod
+    def _candidate_memory(candidate: Any) -> dict[str, Any]:
+        return {
+            "candidate_id": getattr(candidate, "candidate_id", None),
+            "case_id": getattr(candidate, "case_id", None),
+            "title": getattr(candidate, "title", None),
+            "category": getattr(candidate, "category", None),
+            "reasons": getattr(candidate, "reasons", []),
+            "risks": getattr(candidate, "risks", []),
+            "applied": getattr(candidate, "applied", None),
+            "inspected": getattr(candidate, "inspected", None),
         }
-        if params is not None:
-            fov = self._as_float(getattr(params, "fov", None))
-            fnum = self._as_float(getattr(params, "fnum", None))
-            bfl = self._as_float(getattr(params, "bfl", None))
-            thickness = self._as_float(getattr(params, "thickness", None))
-            foclen = self._as_float(getattr(params, "foclen", None))
-            if fov is not None:
-                terms.add("wide") if fov >= 60 else terms.add("narrow")
-                terms.add("fov")
-            if fnum is not None:
-                terms.add("fast") if fnum <= 2.8 else terms.add("slow")
-                terms.add("fnum")
-            if bfl is not None:
-                terms.add("bfl")
-                if foclen and bfl / max(abs(foclen), 1e-9) < 0.35:
-                    terms.add("short")
-                if thickness and bfl / max(abs(thickness), 1e-9) > 0.3:
-                    terms.add("long")
-            if thickness is not None and foclen:
-                terms.add("compact") if thickness / max(abs(foclen), 1e-9) < 0.8 else terms.add("long")
-        return terms
-
-    def _param_relevance_score(self, entry: dict[str, Any], params: Any | None) -> int:
-        if params is None:
-            return 0
-        text = self._lesson_search_text(entry)
-        score = 0
-        fov = self._as_float(getattr(params, "fov", None))
-        fnum = self._as_float(getattr(params, "fnum", None))
-        bfl = self._as_float(getattr(params, "bfl", None))
-        thickness = self._as_float(getattr(params, "thickness", None))
-        foclen = self._as_float(getattr(params, "foclen", None))
-        if fov is not None and fov >= 60 and any(term in text for term in ("wide", "广角", "fov", "视场")):
-            score += 2
-        if fnum is not None and fnum <= 2.8 and any(term in text for term in ("fast", "高速", "f/", "f数")):
-            score += 2
-        if bfl is not None and any(term in text for term in ("bfl", "后焦", "后截距")):
-            score += 1
-        if foclen and thickness and thickness / max(abs(foclen), 1e-9) < 0.8 and any(
-            term in text for term in ("compact", "紧凑", "telephoto", "远摄")
-        ):
-            score += 2
-        return score
 
     @staticmethod
-    def _lesson_search_text(entry: dict[str, Any]) -> str:
-        chunks = [
-            entry.get("topic_key", ""),
-            entry.get("title", ""),
-            entry.get("category", ""),
-            entry.get("lesson", ""),
-            " ".join(AgentMemory._coerce_string_list(entry.get("applicability"))),
-            " ".join(AgentMemory._coerce_string_list(entry.get("signals"))),
-            " ".join(AgentMemory._coerce_string_list(entry.get("guidance"))),
-            " ".join(AgentMemory._coerce_string_list(entry.get("parameter_hints"))),
-            " ".join(AgentMemory._coerce_string_list(entry.get("anti_patterns"))),
-        ]
-        return " ".join(str(chunk) for chunk in chunks).lower()
+    def _compact_trace(agent_trace: list[dict[str, Any]], *, limit: int) -> list[dict[str, Any]]:
+        rows = agent_trace[-limit:]
+        compact: list[dict[str, Any]] = []
+        for row in rows:
+            tool_call = row.get("tool_call") if isinstance(row.get("tool_call"), dict) else {}
+            tool_result = row.get("tool_result") if isinstance(row.get("tool_result"), dict) else {}
+            compact.append(
+                {
+                    "agent": row.get("agent"),
+                    "turn": row.get("turn"),
+                    "thought": row.get("thought"),
+                    "action": tool_call.get("name") or row.get("action"),
+                    "observation": row.get("observation"),
+                    "ok": tool_result.get("ok"),
+                    "error": tool_result.get("error"),
+                }
+            )
+        return compact
 
-    @staticmethod
-    def _as_float(value: Any) -> float | None:
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            return None
-
-    @staticmethod
-    def _lesson_source_ref(result: AgentResult | None) -> str | None:
-        if result is None:
-            return None
-        if result.result_dir:
-            return Path(result.result_dir).name
-        if result.metrics_file:
-            return Path(result.metrics_file).stem
-        return None
-
-    @staticmethod
-    def _merge_unique_strings(existing: list[Any], new_values: list[Any]) -> list[str]:
-        merged: list[str] = []
-        for value in [*existing, *new_values]:
-            item = str(value).strip()
-            if item and item not in merged:
-                merged.append(item)
-        return merged
-
-    @staticmethod
-    def _slugify(value: str) -> str:
-        slug = value.strip().lower()
-        slug = "".join(ch if ("a" <= ch <= "z") or ("0" <= ch <= "9") else "-" for ch in slug)
-        while "--" in slug:
-            slug = slug.replace("--", "-")
-        return slug.strip("-")
-
-    def _normalize_lesson_entry(self, lesson: dict[str, Any]) -> dict[str, Any] | None:
-        if not isinstance(lesson, dict):
-            return None
-        topic_key = self._slugify(str(lesson.get("topic_key", "")))
-        title = str(lesson.get("title", "")).strip()
-        category = str(lesson.get("category", "")).strip() or "general"
-        normalized = {
-            "should_record": bool(lesson.get("should_record", True)),
-            "action": str(lesson.get("action", "create")).strip().lower(),
-            "topic_key": topic_key,
-            "title": title,
-            "category": category,
-            "lesson": str(lesson.get("lesson", "")).strip(),
-            "applicability": self._coerce_string_list(lesson.get("applicability")),
-            "signals": self._coerce_string_list(lesson.get("signals")),
-            "guidance": self._coerce_string_list(lesson.get("guidance")),
-            "parameter_hints": self._coerce_string_list(lesson.get("parameter_hints")),
-            "anti_patterns": self._coerce_string_list(lesson.get("anti_patterns")),
-        }
-        if normalized["action"] not in {"create", "update", "skip"}:
-            normalized["action"] = "create"
-        if normalized["action"] == "skip":
-            normalized["should_record"] = False
-        if not normalized["topic_key"]:
-            normalized["topic_key"] = self._slugify(title) or f"lesson-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-        if not normalized["title"]:
-            normalized["title"] = normalized["topic_key"].replace("-", " ").title()
-        return normalized
-
-    @staticmethod
-    def _coerce_string_list(value: Any) -> list[str]:
-        if not isinstance(value, list):
-            return []
-        return [str(item).strip() for item in value if str(item).strip()]

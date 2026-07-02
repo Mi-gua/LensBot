@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+.cache/
+results/
+node_modules/
+coverage/

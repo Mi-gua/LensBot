@@ -1,58 +1,114 @@
 from __future__ import annotations
 
-import json
-from copy import deepcopy
-from typing import Any
+from pathlib import Path
+from typing import Any, Callable
 
-from agent.llm import OpenAIExtractor
-from agent.settings import LensDesignParams
-from agent.tools import ToolContext, ToolResult
+from agent.tools import ToolArtifact, ToolContext, ToolResult
+from engine.zemax.analysis import ZemaxAnalysisEngine
+from runtime.artifacts import refresh_run_manifest
 
 
-class RequirementTool:
-    name = "parse_requirements"
-    description = "Parse user input into LensDesignParams."
-    category = "general"
-    metadata = {"kind": "llm_parser"}
+class ZemaxAnalysisTool:
+    name = "zemax_analysis"
+    description = "Run OpticStudio/Zemax analysis for a final.zmx file."
+    category = "algorithm"
+    scope = "analysis"
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "final_zmx": {"type": "string"},
+            "result_dir": {"type": "string"},
+        },
+    }
+    output_schema = {"type": "object", "description": "Zemax analysis report."}
+    metadata = {"engine": "zemax", "kind": "external_analysis"}
 
-    def __init__(self, default_params: LensDesignParams):
-        self.default_params = default_params
-        self.extractor = OpenAIExtractor()
+    def __init__(self) -> None:
+        self.engine = ZemaxAnalysisEngine()
 
     def run(self, ctx: ToolContext, **kwargs: Any) -> ToolResult:
-        request = kwargs["request"]
-        if request.mode == "nl":
-            if not request.prompt:
-                return ToolResult(False, "Natural-language input is empty.")
-            params = self.parse(request.prompt, base_params=request.params, system_prompt=ctx.system_prompt)
-            return ToolResult(True, "Parsed natural-language requirements.", params)
-        if request.params is None:
-            return ToolResult(False, "Structured parameter input is empty.")
-        return ToolResult(True, "Loaded structured parameters.", request.params)
+        report = self._analyze(
+            kwargs.get("final_zmx"),
+            result_dir=kwargs.get("result_dir"),
+            progress_cb=ctx.progress_cb,
+        )
+        status = _normalize_status(report)
+        report.setdefault("status", status)
+        report.setdefault("final_zmx", kwargs.get("final_zmx"))
+        if report.get("ok"):
+            report["status"] = "complete"
+            refresh_run_manifest(kwargs.get("result_dir"))
+            artifacts = [
+                ToolArtifact(
+                    item.get("path", ""),
+                    kind="image",
+                    source="zemax",
+                    role=_figure_role(item.get("key")),
+                    stage="analysis",
+                    label=item.get("title", "Zemax figure"),
+                    order=50,
+                )
+                for item in report.get("figures", [])
+                if item.get("path")
+            ]
+            if report.get("report_file"):
+                artifacts.append(
+                    ToolArtifact(
+                        report["report_file"],
+                        kind="report",
+                        source="zemax",
+                        role="zemax_report",
+                        stage="analysis",
+                        label="Zemax report",
+                        order=54,
+                    )
+                )
+            return ToolResult.success("Zemax analysis completed.", report, artifacts=artifacts)
+        observation = {
+            "skipped": "Zemax analysis skipped.",
+            "failed": "Zemax analysis failed.",
+            "unavailable": "Zemax analysis unavailable.",
+        }.get(status, "Zemax analysis unavailable.")
+        code = {
+            "skipped": "zemax_skipped",
+            "failed": "zemax_failed",
+            "unavailable": "zemax_unavailable",
+        }.get(status, "zemax_unavailable")
+        return ToolResult.failure(
+            observation,
+            code=code,
+            data=report,
+            error={"code": code, "message": str(report.get("error") or observation)},
+        )
 
-    def parse(
+    def _analyze(
         self,
-        prompt: str,
-        base_params: LensDesignParams | None = None,
+        final_zmx: str | Path | None,
         *,
-        system_prompt: str = "",
-    ) -> LensDesignParams:
-        extracted = self._parse_with_llm(prompt, system_prompt=system_prompt) or {}
-        params = deepcopy(base_params or self.default_params)
+        result_dir: str | Path | None,
+        progress_cb: Callable[[str], None] | None,
+    ) -> dict[str, Any]:
+        return self.engine.analyze(final_zmx, result_dir=result_dir, progress_cb=progress_cb)
 
-        for key in ("foclen", "fov", "fnum", "bfl", "thickness"):
-            if key in extracted:
-                setattr(params, key, float(extracted[key]))
 
-        for key in ("iterations", "spp", "test_per_iter"):
-            if key in extracted:
-                setattr(params.curriculum, key, int(extracted[key]))
+def _figure_role(key: Any) -> str:
+    return {
+        "fft_mtf": "zemax_mtf",
+        "spot_summary": "zemax_spot_summary",
+        "spot_diagram": "zemax_spot_diagram",
+        "zemax_summary": "zemax_summary",
+    }.get(str(key or ""), "zemax_figure")
 
-        return params
 
-    def _parse_with_llm(self, prompt: str, *, system_prompt: str) -> dict | None:
-        payload = {
-            "task": "extract_requirements",
-            "user_request": prompt,
-        }
-        return self.extractor.extract_json(json.dumps(payload, ensure_ascii=False), system_prompt)
+def _normalize_status(report: dict[str, Any]) -> str:
+    status = str(report.get("status") or "").strip().lower()
+    if status in {"complete", "unavailable", "failed", "skipped"}:
+        return status
+    if report.get("ok"):
+        return "complete"
+    if not report.get("final_zmx") and not report.get("lens_file"):
+        return "skipped"
+    return "unavailable"
+
+
+__all__ = ["ZemaxAnalysisTool"]

@@ -12,6 +12,24 @@ from agent.settings import LensDesignParams
 from engine.deeplens.runtime import ensure_deeplens_import
 
 
+DEEPLENS_ORIGINAL_LRS = [1e-3, 1e-4, 1e-2, 1e-4]
+
+
+def _deeplens_cosine_schedule_with_warmup(optimizer, num_warmup_steps: int, num_training_steps: int):
+    """DeepLens GeoLensOptim cosine warmup scheduler."""
+    import torch
+
+    def lr_lambda(current_step):
+        if current_step < num_warmup_steps:
+            return float(current_step) / float(max(1, num_warmup_steps))
+        progress = float(current_step - num_warmup_steps) / float(
+            max(1, num_training_steps - num_warmup_steps)
+        )
+        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
 def patch_zmx_export_from_final_json(final_json: str | Path, final_zmx: str | Path) -> None:
     """Patch DeepLens ZMX export gaps without modifying the external DeepLens package."""
     final_json = Path(final_json)
@@ -95,25 +113,51 @@ def optimize_autolens_rms(
     params: LensDesignParams,
     result_dir: str | Path,
     artifact_cb: Callable[[], None] | None = None,
+    progress_cb: Callable[[str], None] | None = None,
 ) -> dict:
     ensure_deeplens_import(Path(__file__))
     result_dir = Path(result_dir)
 
     import torch
+    from torch.nn.functional import softplus
     from tqdm import tqdm
-    from transformers import get_cosine_schedule_with_warmup
 
-    from deeplens.optics import GeoLens
-    from deeplens.optics.config import DEPTH, EPSILON, WAVE_RGB
-    from deeplens.optics.geolens_pkg.utils import create_lens
+    try:
+        from deeplens.optics import GeoLens
+        from deeplens.optics.config import DEPTH, EPSILON, WAVE_RGB
+        from deeplens.optics.geolens_pkg.utils import create_lens
+    except ModuleNotFoundError:
+        from deeplens import GeoLens
+        from deeplens.config import DEPTH, EPSILON, WAVE_RGB
+        from deeplens.geolens_pkg.optim_init import create_lens
     from deeplens.utils import set_seed
 
     if params.seed is None:
         params.seed = random.randint(0, 100000)
     set_seed(params.seed)
-    def emit_progress(stage: str, step: int, total: int, **metrics: float) -> None:
-        _ = (stage, step, total, metrics)
+    progress_marks: dict[str, int] = {}
 
+    def emit_progress(stage: str, step: int, total: int, **metrics: float) -> None:
+        if not progress_cb:
+            return
+        if total <= 0:
+            return
+        mark = progress_marks.get(stage, 1)
+        threshold = math.ceil(total * mark / 5)
+        if step < threshold and step < total:
+            return
+        stage_labels = {
+            "Curriculum": "\u8bfe\u7a0b\u5b66\u4e60",
+            "FineTune": "\u5fae\u8c03",
+        }
+        percent = min(100, int(round(step / total * 100)))
+        progress_cb(
+            f"{stage_labels.get(stage, stage)}\u8fdb\u5ea6 {percent}%\uff1a"
+            f"\u7b2c {step}/{total} \u8f6e\u3002"
+        )
+        while mark <= 5 and step >= math.ceil(total * mark / 5):
+            mark += 1
+        progress_marks[stage] = mark
     logging.info("EXP: %s", params.exp_name)
     logging.info("Seed: %s", params.seed)
 
@@ -135,11 +179,13 @@ def optimize_autolens_rms(
         iter_dir.mkdir(parents=True, exist_ok=True)
         depth = DEPTH
         spp = int(stage_params.spp)
-        optimizer = self.get_optimizer(stage_params.lrs, optim_mat=stage_params.optim_mat)
+        if progress_cb:
+            progress_cb(f"\u5f00\u59cb\u8bfe\u7a0b\u5b66\u4e60\uff1a\u5171 {int(stage_params.iterations)} \u8f6e\u3002")
+        optimizer = self.get_optimizer(DEEPLENS_ORIGINAL_LRS, optim_mat=True)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            optimizer, T_0=max(1, int(stage_params.iterations) // 4), T_mult=1
+            optimizer, T_0=int(stage_params.iterations) // 4, T_mult=1
         )
-        aper_start = self.surfaces[self.aper_idx].r * float(stage_params.aper_start_ratio)
+        aper_start = self.surfaces[self.aper_idx].r * 0.25
         aper_final = self.surfaces[self.aper_idx].r
 
         pbar = tqdm(
@@ -153,20 +199,17 @@ def optimize_autolens_rms(
         for i in range(total_iters + 1):
             if i % int(stage_params.test_per_iter) == 0:
                 with torch.no_grad():
-                    progress = 0.5 * (
-                        1 + math.cos(math.pi * (1 - i / max(1, total_iters)))
-                    )
+                    progress = 0.5 * (1 + math.cos(math.pi * (1 - i / total_iters)))
                     aper_r = min(aper_start + (aper_final - aper_start) * progress, aper_final)
                     self.surfaces[self.aper_idx].update_r(aper_r)
                     self.calc_pupil()
                     if i > 0:
-                        if stage_params.shape_control:
-                            self.correct_shape()
-                        if stage_params.optim_mat and stage_params.match_mat:
-                            self.match_materials()
+                        self.correct_shape()
                     iter_base = iter_dir / f"iter{i}"
                     self.write_lens_json(str(iter_base.with_suffix(".json")))
                     self.analysis(str(iter_base))
+                    if artifact_cb:
+                        artifact_cb()
 
                     rays_backup = []
                     for wv in WAVE_RGB:
@@ -176,7 +219,7 @@ def optimize_autolens_rms(
                             depth=depth,
                             spp=spp,
                             wvln=wv,
-                            scale_pupil=float(stage_params.scale_pupil),
+                            scale_pupil=1.10,
                         )
                         rays_backup.append(ray)
                     center_ref = -self.psf_center(points_obj=ray.o[:, :, 0, :], method="pinhole")
@@ -193,10 +236,9 @@ def optimize_autolens_rms(
                     with torch.no_grad():
                         weight_mask = ((ray_err**2).sum(-1) * ray_valid).sum(-1)
                         weight_mask /= ray_valid.sum(-1) + EPSILON
-                        weight_mask /= weight_mask.mean() + EPSILON
-                        if float(stage_params.weight_dropout) > 0:
-                            dropout_mask = torch.rand_like(weight_mask) < float(stage_params.weight_dropout)
-                            weight_mask = weight_mask * (~dropout_mask)
+                        weight_mask /= weight_mask.mean()
+                        dropout_mask = torch.rand_like(weight_mask) < 0.1
+                        weight_mask = weight_mask * (~dropout_mask)
                 l_rms = ((ray_err**2).sum(-1) * ray_valid).sum(-1)
                 l_rms /= ray_valid.sum(-1) + EPSILON
                 l_rms = (l_rms + EPSILON).sqrt()
@@ -207,7 +249,7 @@ def optimize_autolens_rms(
             loss_rms = sum(loss_rms) / len(loss_rms)
             loss_focus = self.loss_infocus()
             loss_reg, _loss_dict = self.loss_reg()
-            total_loss = loss_rms + float(stage_params.w_focus) * loss_focus + float(stage_params.w_reg) * loss_reg
+            total_loss = loss_rms + 0.1 * loss_focus + 0.05 * loss_reg
             optimizer.zero_grad()
             total_loss.backward()
             optimizer.step()
@@ -220,19 +262,21 @@ def optimize_autolens_rms(
     def fine_tune_design(self: GeoLens, stage_params, result_path: str):
         result_dir = Path(result_path)
         result_dir.mkdir(parents=True, exist_ok=True)
-        depth = DEPTH
+        depth = self.obj_depth
         spp = int(stage_params.spp)
-        optimizer = self.get_optimizer(stage_params.lrs, optim_mat=stage_params.optim_mat)
-        scheduler = get_cosine_schedule_with_warmup(
+        if progress_cb:
+            progress_cb(f"\u5f00\u59cb\u4f18\u5316\u5fae\u8c03\uff1a\u5171 {int(stage_params.iterations)} \u8f6e\u3002")
+        optimizer = self.get_optimizer(DEEPLENS_ORIGINAL_LRS, optim_mat=False)
+        scheduler = _deeplens_cosine_schedule_with_warmup(
             optimizer,
-            num_warmup_steps=int(stage_params.num_warmup_steps),
+            num_warmup_steps=100,
             num_training_steps=int(stage_params.iterations),
         )
 
         pbar = tqdm(
             total=int(stage_params.iterations) + 1,
             desc="FineTune",
-            postfix={"loss_rms": 0, "loss_focus": 0},
+            postfix={"loss_rms": 0},
             disable=False,
             file=sys.stdout,
         )
@@ -241,72 +285,79 @@ def optimize_autolens_rms(
             if i % int(stage_params.test_per_iter) == 0:
                 with torch.no_grad():
                     logging.info("FineTune checkpoint start: iter=%s", i)
-                    if stage_params.shape_control and i > 0:
+                    if i > 0:
                         self.correct_shape()
                     iter_path = str(result_dir / f"iter{i}")
                     self.write_lens_json(f"{iter_path}.json")
-                    # Skip expensive analysis at iter 0 to avoid long apparent stall at 0%.
-                    if i > 0:
-                        self.analysis(iter_path)
-                        if artifact_cb:
-                            artifact_cb()
+                    self.analysis(iter_path)
+                    if artifact_cb:
+                        artifact_cb()
                     logging.info("FineTune checkpoint done: iter=%s", i)
                     self.calc_pupil()
                     rays_backup = []
-                    for wv in WAVE_RGB:
+                    for wv in self.wvln_rgb:
                         ray = self.sample_ring_arm_rays(
                             num_ring=int(stage_params.num_ring),
                             num_arm=int(stage_params.num_arm),
                             spp=spp,
                             depth=depth,
                             wvln=wv,
-                            scale_pupil=float(stage_params.scale_pupil),
+                            scale_pupil=1.05,
                             sample_more_off_axis=False,
                         )
                         rays_backup.append(ray)
-                    center_method = "chief_ray" if stage_params.centroid else "pinhole"
-                    center_ref = -self.psf_center(points_obj=ray.o[:, :, 0, :], method=center_method)
-                    center_ref = center_ref.unsqueeze(-2).repeat(1, 1, spp, 1)
+                    pinhole_ref = -self.psf_center(points_obj=ray.o[:, :, 0, :], method="pinhole")
 
             loss_rms_ls = []
-            for wv_idx, _wv in enumerate(WAVE_RGB):
+            loss_distortion = torch.tensor(0.0, device=self.device)
+            weight_mask = None
+            center_ref = None
+            wvln_order = [1, 0, 2]
+            for wv_idx in wvln_order:
                 ray = rays_backup[wv_idx].clone()
                 ray = self.trace2sensor(ray)
-                ray_xy = ray.o[..., :2]
+
+                if center_ref is None:
+                    centroid_xy = ray.centroid()[..., :2]
+                    ideal_height = pinhole_ref.norm(dim=-1)
+                    field_mask = ideal_height > EPSILON
+                    distortion = (centroid_xy - pinhole_ref).norm(dim=-1)
+                    distortion = distortion / ideal_height.clamp_min(EPSILON)
+                    violation = distortion - self.distortion_max
+                    penalty = softplus(violation / self.distortion_max, beta=20.0)
+                    n_fields = field_mask.sum().clamp_min(1)
+                    loss_distortion = (penalty * field_mask.float()).sum() / n_fields
+                    center_ref = centroid_xy.detach().unsqueeze(-2)
+
                 ray_valid = ray.is_valid
-                ray_err = ray_xy - center_ref
+                ray_err = ray.o[..., :2] - center_ref
                 ray_err = torch.where(ray_valid.bool().unsqueeze(-1), ray_err, torch.zeros_like(ray_err))
-                if wv_idx == 0:
-                    with torch.no_grad():
-                        weight_mask = (ray_err**2).sum(-1).sum(-1)
-                        weight_mask /= ray_valid.sum(-1) + EPSILON
-                        weight_mask /= weight_mask.mean() + EPSILON
-                        if float(stage_params.weight_dropout) > 0:
-                            dropout_mask = torch.rand_like(weight_mask) < float(stage_params.weight_dropout)
-                            weight_mask = weight_mask * (~dropout_mask)
-                l_rms = (ray_err**2).sum(-1).sum(-1)
-                l_rms /= ray_valid.sum(-1) + EPSILON
-                l_rms = (l_rms + EPSILON).sqrt()
+
+                mse = (ray_err**2).sum(-1).sum(-1) / (ray_valid.sum(-1) + EPSILON)
+                if weight_mask is None:
+                    weight_mask = mse.detach().sqrt().clone()
+                    weight_mask = weight_mask / (weight_mask.mean() + EPSILON)
+                    weight_mask[0, :] = 1.0
+
+                l_rms = torch.clamp(mse, min=EPSILON).sqrt()
                 l_rms_weighted = (l_rms * weight_mask).sum()
                 l_rms_weighted /= weight_mask.sum() + EPSILON
                 loss_rms_ls.append(l_rms_weighted)
 
             loss_rms = sum(loss_rms_ls) / len(loss_rms_ls)
-            loss_focus = self.loss_infocus()
             loss_reg, loss_dict = self.loss_reg()
-            total_loss = loss_rms + float(stage_params.w_focus) * loss_focus + float(stage_params.w_reg) * loss_reg
+            total_loss = loss_rms + 0.1 * (loss_reg + loss_distortion)
             optimizer.zero_grad()
             total_loss.backward()
             optimizer.step()
             scheduler.step()
-            pbar.set_postfix(loss_rms=loss_rms.item(), loss_focus=loss_focus.item(), **loss_dict)
+            pbar.set_postfix(loss_rms=loss_rms.item(), loss_dist=loss_distortion.item(), **loss_dict)
             pbar.update(1)
             emit_progress(
                 "FineTune",
                 i,
                 total_iters,
                 loss_rms=loss_rms.item(),
-                loss_focus=loss_focus.item(),
             )
         pbar.close()
 
@@ -317,10 +368,13 @@ def optimize_autolens_rms(
     lens.match_materials()
     lens.set_fnum(params.fnum)
     lens.write_lens_json(f"{result_dir}/curriculum.json")
+    lens.analysis(save_name=f"{result_dir}/curriculum")
     if artifact_cb:
         artifact_cb()
 
     lens = GeoLens(filename=f"{result_dir}/curriculum.json")
+    lens.set_target_fov_fnum(rfov=params.fov / 2 / 57.3, fnum=params.fnum)
+    lens.set_fnum(params.fnum)
     lens.fine_tune_design(stage_params=params.fine_tune, result_path=f"{result_dir}/fine-tune")
     lens.prune_surf(expand_factor=0.05)
     lens.post_computation()
@@ -337,6 +391,9 @@ def optimize_autolens_rms(
         "final_json": str(result_dir / "final.json"),
         "final_zmx": str(final_zmx),
         "rfov": str(lens.rfov),
+        "rfov_deg": float(math.degrees(float(lens.rfov))),
+        "fov_deg": float(2.0 * math.degrees(float(lens.rfov))),
         "fnum": float(lens.fnum),
         "r_sensor": float(lens.r_sensor),
+        "structure_group_count": len(params.surf_list),
     }

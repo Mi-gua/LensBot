@@ -5,18 +5,71 @@ import os
 import re
 
 
-OPENAI_BASE_URL = os.getenv("LENSBOT_OPENAI_BASE_URL", "https://api.z.ai/api/paas/v4/")
-OPENAI_API_KEY = os.getenv("LENSBOT_OPENAI_API_KEY", "79cffcb78bca4cbbb115c220babd9feb.CIqJ6dBx8yyJwuVO")
-OPENAI_MODEL = os.getenv("LENSBOT_OPENAI_MODEL", "glm-5.1")
-OPENAI_TEMPERATURE = float(os.getenv("LENSBOT_OPENAI_TEMPERATURE", "1"))
+OPENAI_BASE_URL_DEFAULT = "https://api.openai.com/v1"
+ANTHROPIC_BASE_URL_DEFAULT = "https://api.anthropic.com/v1"
+ZHIPU_BASE_URL_DEFAULT = "https://open.bigmodel.cn/api/paas/v4"
+DEEPSEEK_BASE_URL_DEFAULT = "https://api.deepseek.com"
+
+DEFAULT_OPENAI_BASE_URL = "https://open.bigmodel.cn/api/paas/v4"
+DEFAULT_OPENAI_MODEL = "glm-5.1"
+LLM_PROVIDERS = [
+    {
+        "id": "openai",
+        "label": "OpenAI",
+        "base_url": OPENAI_BASE_URL_DEFAULT,
+        "model_placeholder": "gpt-5.5",
+    },
+    {
+        "id": "anthropic",
+        "label": "Anthropic",
+        "base_url": ANTHROPIC_BASE_URL_DEFAULT,
+        "model_placeholder": "claude-sonnet-4.5",
+    },
+    {
+        "id": "zhipu",
+        "label": "Zhipu",
+        "base_url": ZHIPU_BASE_URL_DEFAULT,
+        "model_placeholder": "glm-5.1",
+    },
+    {
+        "id": "deepseek",
+        "label": "DeepSeek",
+        "base_url": DEEPSEEK_BASE_URL_DEFAULT,
+        "model_placeholder": "deepseek-v4-flash",
+    },
+    {
+        "id": "custom",
+        "label": "其他",
+        "base_url": "",
+        "model_placeholder": "GPT-5.5",
+    },
+]
+
+
+def normalize_base_url(value: str | None) -> str:
+    return str(value or "").strip().rstrip("/").lower()
+
+
+def resolve_provider_id(base_url: str | None) -> str:
+    normalized = normalize_base_url(base_url)
+    for provider in LLM_PROVIDERS:
+        if provider["id"] == "custom":
+            continue
+        if normalized and normalized == normalize_base_url(provider.get("base_url")):
+            return provider["id"]
+    return "custom"
+
+
+OPENAI_BASE_URL = os.getenv("LENSBOT_OPENAI_BASE_URL", DEFAULT_OPENAI_BASE_URL).strip()
+OPENAI_MODEL = os.getenv("LENSBOT_OPENAI_MODEL", DEFAULT_OPENAI_MODEL)
 
 
 class OpenAIExtractor:
     def __init__(self) -> None:
-        self.base_url = OPENAI_BASE_URL
-        self.api_key = OPENAI_API_KEY
-        self.model = OPENAI_MODEL
-        self.temperature = OPENAI_TEMPERATURE
+        self.base_url = os.getenv("LENSBOT_OPENAI_BASE_URL", DEFAULT_OPENAI_BASE_URL).strip()
+        self.api_key = os.getenv("LENSBOT_OPENAI_API_KEY", "").strip()
+        self.model = os.getenv("LENSBOT_OPENAI_MODEL", DEFAULT_OPENAI_MODEL)
+        self.temperature = float(os.getenv("LENSBOT_OPENAI_TEMPERATURE", "0.3"))
         self.last_error = ""
         self.last_content = ""
 

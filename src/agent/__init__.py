@@ -16,29 +16,35 @@ __all__ = [
     "LensResearchAgent",
     "LensWorkflow",
     "LensToolset",
-    "ReactAgentLoop",
-    "ReactState",
-    "ReactTurn",
+    "ToolCall",
     "ToolContext",
+    "ToolDefinition",
+    "ToolError",
     "ToolRegistry",
     "ToolResult",
+    "ToolSchema",
 ]
 
 
 def __getattr__(name: str) -> Any:
     if name == "build_agent_input":
-        from agent.settings import build_agent_input
+        from subagents.types import build_agent_input
 
         return build_agent_input
-    if name in {"ReactAgentLoop", "ReactState", "ReactTurn"}:
-        from agent import loop
-
-        return getattr(loop, name)
     if name in {"LensResearchAgent", "LensWorkflow"}:
         from agent import workflow
 
         return getattr(workflow, name)
-    if name in {"LensToolset", "ToolContext", "ToolRegistry", "ToolResult"}:
+    if name in {
+        "LensToolset",
+        "ToolCall",
+        "ToolContext",
+        "ToolDefinition",
+        "ToolError",
+        "ToolRegistry",
+        "ToolResult",
+        "ToolSchema",
+    }:
         from agent import tools
 
         return getattr(tools, name)
