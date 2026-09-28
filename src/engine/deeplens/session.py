@@ -13,6 +13,7 @@ from engine.deeplens.autolens_rms import (
     DEEPLENS_ORIGINAL_LRS,
     _deeplens_cosine_schedule_with_warmup,
     patch_zmx_export_from_final_json,
+    prune_lens_surfaces,
 )
 from engine.deeplens.runtime import ensure_deeplens_import
 from runtime.artifacts import refresh_run_manifest
@@ -27,7 +28,6 @@ ArtifactCallback = Callable[[str], None]
 @dataclass
 class SessionStrategy:
     lr_scale: float = 1.0
-    focus_weight_scale: float = 1.0
     rollback_count: int = 0
     notes: list[str] = field(default_factory=list)
 
@@ -47,19 +47,24 @@ class DeepLensOptimizationSession:
         self.params = params
         self.result_dir = result_dir
         self.workspace = ResultWorkspace.from_result_dir(result_dir)
-        self.curriculum_dir = self.workspace.deeplens_attempt_dir("curriculum", 1)
-        self.finetune_dir = self.workspace.deeplens_attempt_dir("finetune", 2)
+        attempt_index = self._next_attempt_index()
+        self.curriculum_dir = self.workspace.deeplens_attempt_dir("curriculum", attempt_index)
+        self.finetune_dir = self.workspace.deeplens_attempt_dir("finetune", attempt_index + 1)
+        self.curriculum_dir.mkdir(parents=True, exist_ok=False)
+        self.finetune_dir.mkdir(parents=True, exist_ok=False)
         self.session_id = session_id or uuid.uuid4().hex[:10]
         self.progress_cb = progress_cb
         self.artifact_cb = artifact_cb
         self.phase = "created"
         self.curriculum_iter = 0
         self.fine_tune_iter = 0
-        self.strategy = SessionStrategy()
+        self.strategy = SessionStrategy(lr_scale=float(params.lr_scale))
         self.checkpoints: list[dict[str, Any]] = []
         self.last_losses: dict[str, float] = {}
         self.last_diagnostics: dict[str, Any] = {}
         self.last_strategy: dict[str, Any] = {"action": "idle", "reason": "session created"}
+        self.last_candidate: dict[str, Any] | None = None
+        self.last_execution: dict[str, Any] = {}
 
         self.lens: Any = None
         self.optimizer: Any = None
@@ -114,48 +119,41 @@ class DeepLensOptimizationSession:
         if self.phase != "curriculum":
             return self.describe()
         total = max(1, int(self.params.curriculum.iterations))
-        remaining = max(0, total + 1 - self.curriculum_iter)
+        remaining = max(0, total - self.curriculum_iter)
         iteration_count = min(max(1, int(iteration_count)), remaining)
 
         for _ in range(iteration_count):
             i = self.curriculum_iter
-            if i > total:
+            if i >= total:
                 break
-            if i % int(self.params.curriculum.test_per_iter) == 0 or self._curriculum_rays is None:
+            if i % int(self.params.curriculum.test_per_iter) == 0 or i == total - 1 or self._curriculum_rays is None:
                 self._prepare_curriculum_checkpoint(i)
             self._curriculum_step()
             self.curriculum_iter += 1
 
-        if self.curriculum_iter > total:
+        if self.curriculum_iter >= total:
             self._finish_curriculum()
 
         self._archive_state()
         return self.describe()
 
-    def run_finetune_chunk(self, iteration_count: int) -> dict[str, Any]:
-        if self.phase == "curriculum_complete":
-            self._init_fine_tune()
+    def _run_finetune_steps(self, iteration_count: int) -> int:
         if self.phase != "fine_tune":
-            return self.describe()
-
-        total = max(1, int(self.params.fine_tune.iterations))
-        remaining = max(0, total + 1 - self.fine_tune_iter)
-        iteration_count = min(max(1, int(iteration_count)), remaining)
+            raise RuntimeError(f"Fine-tune steps require phase=fine_tune, received {self.phase}.")
+        iteration_count = int(iteration_count)
+        if iteration_count < 1:
+            raise ValueError("Fine-tune iterations must be a positive integer.")
 
         for _ in range(iteration_count):
             i = self.fine_tune_iter
-            if i > total:
-                break
             if i % int(self.params.fine_tune.test_per_iter) == 0 or self._fine_tune_rays is None:
                 self._prepare_fine_tune_checkpoint(i)
             self._fine_tune_step()
             self.fine_tune_iter += 1
 
-        if self.fine_tune_iter > total:
-            self.phase = "ready_to_finalize"
-
+        self.phase = "ready_to_finalize"
         self._archive_state()
-        return self.describe()
+        return iteration_count
 
     def inspect_checkpoint(self) -> dict[str, Any]:
         diagnostics = self._diagnostics()
@@ -165,47 +163,100 @@ class DeepLensOptimizationSession:
 
     def adjust_strategy(self, strategy: dict[str, Any]) -> dict[str, Any]:
         action = str(strategy.get("action") or "")
-        self.last_strategy = dict(strategy or {"action": "idle"})
+        result = {**strategy, "applied": False}
         if action == "reduce_lr":
-            self.strategy.lr_scale = max(0.1, self.strategy.lr_scale * 0.5)
-            self._scale_optimizer_lr(0.5)
-            self.strategy.notes.append("Reduced learning rate scale.")
-        elif action == "increase_first_order_lock":
-            self.strategy.focus_weight_scale = min(5.0, self.strategy.focus_weight_scale * 1.5)
-            self.strategy.notes.append("Increased curriculum focus loss weight scale.")
+            old_scale = self.strategy.lr_scale
+            new_scale = max(0.1, old_scale * 0.5)
+            if new_scale < old_scale:
+                self.strategy.lr_scale = new_scale
+                self._scale_optimizer_lr(new_scale / old_scale)
+                self.strategy.notes.append("Reduced learning rate scale.")
+                result.update({
+                    "applied": True,
+                    "effect_scope": "current_optimizer" if self.phase in {"curriculum", "fine_tune"} else "next_optimizer_pass",
+                })
+            else:
+                result["effect_scope"] = "none"
         elif action == "rollback_to_best_checkpoint":
+            if self.phase not in {"curriculum", "fine_tune"}:
+                raise ValueError(f"Rollback requires an active optimizer phase, received {self.phase}.")
             rolled = self._rollback_to_best_checkpoint()
-            if rolled:
-                self.strategy.rollback_count += 1
-                self.strategy.notes.append("Rolled back to best stable checkpoint.")
+            if not rolled:
+                raise ValueError("Rollback found no compatible checkpoint for the active phase.")
+            self.strategy.rollback_count += 1
+            self.strategy.notes.append("Rolled back to best stable checkpoint.")
+            result.update({"applied": True, "effect_scope": "current_optimizer"})
+        else:
+            raise ValueError(f"Unsupported strategy action: {action}")
+        self.last_strategy = result
         self._archive_state()
         return self.describe()
 
-    def finalize(self) -> dict[str, Any]:
-        if self.phase == "curriculum":
-            self._finish_curriculum()
-        if self.phase == "curriculum_complete":
-            self._init_fine_tune()
-        if self.phase == "fine_tune":
-            total = int(self.params.fine_tune.iterations)
-            self.run_finetune_chunk(total + 1)
+    def run_finetune(self, source_lens: str | Path | None = None) -> dict[str, Any]:
+        """Execute a pass, then export. Repeated calls refine the last candidate.
 
-        self.lens.prune_surf(expand_factor=0.05)
+        An exported prescription is a new pass with fresh optimizer/scheduler,
+        not continuation of stale optimizer state after pruning/material changes.
+        """
+        iterations_requested = int(self.params.fine_tune.iterations)
+        if iterations_requested < 1:
+            raise ValueError("Fine-tune iterations must be a positive integer.")
+        phase_before = self.phase
+        if source_lens is None and self.phase == "candidate_exported":
+            if self.last_candidate is None:
+                raise ValueError("Exported session has no recorded candidate source.")
+            source_lens = self.last_candidate["candidate_json"]
+        if source_lens is not None:
+            source_lens = Path(source_lens)
+            if not source_lens.is_file():
+                raise ValueError(f"Fine-tune source does not exist: {source_lens}")
+            self._load_deeplens()
+            self.workspace.ensure()
+            self._init_fine_tune(source_lens=source_lens, attempt_stage="refine")
+        elif self.phase == "curriculum_complete":
+            self._init_fine_tune()
+        elif self.phase != "fine_tune":
+            raise ValueError(f"Cannot fine-tune session in phase {self.phase}; supply a lens artifact.")
+
+        executed = self._run_finetune_steps(iterations_requested)
+        self.last_execution = {
+            "phase_before": phase_before,
+            "source_lens": str(source_lens or (self.curriculum_dir / "curriculum.json")),
+            "iterations_requested": iterations_requested,
+            "iterations_executed": executed,
+            "lr_scale": self.strategy.lr_scale,
+            "optimizer_reinitialized": phase_before != "fine_tune" or source_lens is not None,
+        }
+        return {**self.export_candidate(), **self.last_execution}
+
+    def export_candidate(self) -> dict[str, Any]:
+        """Export a completed pass once; never perform optimization here."""
+        if self.phase == "candidate_exported" and self.last_candidate is not None:
+            return dict(self.last_candidate)
+        if self.phase != "ready_to_finalize":
+            raise ValueError(f"Cannot export unfinished session in phase {self.phase}.")
+        if not self.last_execution:
+            raise ValueError("Cannot export a candidate without a completed optimizer pass.")
+
+        prune_lens_surfaces(self.lens)
         self.lens.post_computation()
-        final_json = self.workspace.final_dir / "final.json"
-        final_zmx = self.workspace.final_dir / "final.zmx"
-        self.lens.write_lens_json(str(final_json))
-        self.lens.write_lens_zmx(str(final_zmx))
-        patch_zmx_export_from_final_json(final_json, final_zmx)
-        self.lens.analysis(save_name=str(self.workspace.final_dir / "final"))
-        self.phase = "finalized"
+        candidate_dir = self.workspace.candidate_dir(self._next_candidate_index())
+        candidate_dir.mkdir(parents=True, exist_ok=True)
+        candidate_json = candidate_dir / "lens.json"
+        candidate_zmx = candidate_dir / "lens.zmx"
+        self.lens.write_lens_json(str(candidate_json))
+        self.lens.write_lens_zmx(str(candidate_zmx))
+        patch_zmx_export_from_final_json(candidate_json, candidate_zmx)
+        self.lens.analysis(save_name=str(candidate_dir / "lens"))
+        self.phase = "candidate_exported"
         self._emit_artifact()
-        self._archive_state()
-        return {
+        self.last_candidate = {
             **self.describe(),
             "curriculum_json": str(self.curriculum_dir / "curriculum.json"),
-            "final_json": str(final_json),
-            "final_zmx": str(final_zmx),
+            "candidate_id": candidate_dir.name,
+            "candidate_json": str(candidate_json),
+            "candidate_zmx": str(candidate_zmx),
+            "candidate_png": str(candidate_dir / "lens.png"),
             "rfov": str(self.lens.rfov),
             "rfov_deg": float(math.degrees(float(self.lens.rfov))),
             "fov_deg": float(2.0 * math.degrees(float(self.lens.rfov))),
@@ -213,6 +264,31 @@ class DeepLensOptimizationSession:
             "r_sensor": float(self.lens.r_sensor),
             "structure_group_count": len(self.params.surf_list),
         }
+        execution = {
+            "candidate_id": candidate_dir.name,
+            "candidate_json": str(candidate_json.resolve()),
+            "optimizer_pass_id": f"{self.session_id}/{candidate_dir.name}",
+            "source_lens": self.last_execution.get("source_lens"),
+            "iterations_requested": self.last_execution.get("iterations_requested"),
+            "iterations_executed": self.last_execution.get("iterations_executed"),
+            "lr_scale": self.last_execution.get("lr_scale"),
+            "optimizer_reinitialized": self.last_execution.get("optimizer_reinitialized"),
+        }
+        (candidate_dir / "execution.json").write_text(
+            json.dumps(execution, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        self.last_candidate["execution"] = execution
+        self._archive_state()
+        (candidate_dir / "session.json").write_text(
+            json.dumps(self.describe(), ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        return dict(self.last_candidate)
+
+    def refine_from_lens(self, source_lens: str | Path) -> dict[str, Any]:
+        """Start a new fine-tune pass from an explicit clean lens artifact."""
+        return self.run_finetune(source_lens)
 
     def describe(self) -> dict[str, Any]:
         return {
@@ -225,7 +301,6 @@ class DeepLensOptimizationSession:
             "fine_tune_total": int(self.params.fine_tune.iterations),
             "strategy": {
                 "lr_scale": self.strategy.lr_scale,
-                "focus_weight_scale": self.strategy.focus_weight_scale,
                 "rollback_count": self.strategy.rollback_count,
                 "notes": self.strategy.notes[-5:],
             },
@@ -233,6 +308,8 @@ class DeepLensOptimizationSession:
             "last_losses": self.last_losses,
             "last_diagnostics": self.last_diagnostics,
             "last_strategy": self.last_strategy,
+            "last_execution": dict(self.last_execution),
+            "last_candidate_json": self.last_candidate.get("candidate_json") if self.last_candidate else None,
             "params": public_params_dict(self.params),
         }
 
@@ -279,8 +356,14 @@ class DeepLensOptimizationSession:
         self._aper_start = float(self.lens.surfaces[self.lens.aper_idx].r) * 0.25
         self._aper_final = float(self.lens.surfaces[self.lens.aper_idx].r)
 
-    def _init_fine_tune(self) -> None:
-        self.lens = self._GeoLens(filename=str(self.curriculum_dir / "curriculum.json"))
+    def _init_fine_tune(self, source_lens: Path | None = None, attempt_stage: str = "finetune") -> None:
+        self.lens = self._GeoLens(filename=str(source_lens or (self.curriculum_dir / "curriculum.json")))
+        self._init_fine_tune_from_loaded_lens(attempt_stage=attempt_stage)
+
+    def _init_fine_tune_from_loaded_lens(self, attempt_stage: str = "finetune") -> None:
+        if attempt_stage != "finetune":
+            self.finetune_dir = self.workspace.deeplens_attempt_dir(attempt_stage, self._next_attempt_index())
+            (self.finetune_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
         self.lens.set_target_fov_fnum(rfov=self.params.fov / 2 / 57.3, fnum=self.params.fnum)
         self.lens.set_fnum(self.params.fnum)
         lrs = [lr * self.strategy.lr_scale for lr in DEEPLENS_ORIGINAL_LRS]
@@ -293,12 +376,35 @@ class DeepLensOptimizationSession:
         )
         self._fine_tune_rays = None
         self._fine_tune_pinhole_ref = None
+        self.fine_tune_iter = 0
         self.phase = "fine_tune"
+
+    def _next_attempt_index(self) -> int:
+        attempts_root = self.workspace.deeplens_dir / "attempts"
+        indices: list[int] = []
+        for path in attempts_root.glob("attempt-*"):
+            parts = path.name.split("-", 2)
+            if len(parts) >= 2:
+                try:
+                    indices.append(int(parts[1]))
+                except ValueError:
+                    pass
+        return (max(indices) + 1) if indices else 1
+
+    def _next_candidate_index(self) -> int:
+        indices: list[int] = []
+        for path in self.workspace.candidates_dir.glob("candidate-*"):
+            try:
+                indices.append(int(path.name.split("-", 1)[1]))
+            except (IndexError, ValueError):
+                pass
+        return (max(indices) + 1) if indices else 1
 
     def _prepare_curriculum_checkpoint(self, i: int) -> None:
         total = max(1, int(self.params.curriculum.iterations))
         with self._torch.no_grad():
-            progress = 0.5 * (1 + math.cos(math.pi * (1 - i / total)))
+            fraction = i / (total - 1) if total > 1 else 1.0
+            progress = 0.5 * (1 + math.cos(math.pi * (1 - fraction)))
             aper_r = min(self._aper_start + (self._aper_final - self._aper_start) * progress, self._aper_final)
             self.lens.surfaces[self.lens.aper_idx].update_r(aper_r)
             self.lens.calc_pupil()
@@ -352,7 +458,7 @@ class DeepLensOptimizationSession:
         loss_reg, _loss_dict = self.lens.loss_reg()
         total_loss = (
             loss_rms_value
-            + 0.1 * self.strategy.focus_weight_scale * loss_focus
+            + 0.1 * loss_focus
             + 0.05 * loss_reg
         )
         self.optimizer.zero_grad()
@@ -546,10 +652,9 @@ class DeepLensOptimizationSession:
         payload = self.describe()
         if extra:
             payload.update(extra)
-        (self.workspace.deeplens_dir / "session.json").write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+        for directory in (self.curriculum_dir, self.finetune_dir, self.workspace.deeplens_dir):
+            (directory / "session.json").write_text(text, encoding="utf-8")
 
     def _emit_artifact(self) -> None:
         refresh_run_manifest(

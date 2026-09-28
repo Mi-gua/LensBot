@@ -14,6 +14,11 @@ def _enable_local_imports() -> None:
 
 def main() -> None:
     _enable_local_imports()
+    import os
+
+    from agent.llm import DEFAULT_OPENAI_MODEL
+
+    os.environ["LENSBOT_OPENAI_MODEL"] = DEFAULT_OPENAI_MODEL
     from ui.gui import run_server
 
     run_server()

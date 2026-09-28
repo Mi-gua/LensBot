@@ -41,23 +41,22 @@ class PiOptimizationBridge:
         context: JsonObject,
         tool_definitions: list[JsonObject],
         objective: str,
-        max_turns: int,
+        max_turns: int | None,
         emit: EmitCallback | None = None,
         on_event: EventCallback | None = None,
-        tool_server_mode: str = "real",
     ) -> None:
         self.project_root = project_root
         self.context = context
         self.tool_definitions = tool_definitions
         self.objective = objective
-        self.max_turns = max(1, int(max_turns))
+        self.max_turns = max(1, int(max_turns)) if max_turns is not None else None
         self.emit = emit
         self.on_event = on_event
-        self.tool_server_mode = "fake" if tool_server_mode == "fake" else "real"
         self._events: list[JsonObject] = []
+        self._last_state: JsonObject = {}
 
     def run(self) -> PiBridgeResult:
-        runner = self.project_root / "pi-agent" / "src" / "pi-sidecar.ts"
+        runner = self.project_root / "src" / "pi-agent" / "src" / "pi-sidecar.ts"
         if not runner.exists():
             raise PiBridgeError(f"pi-agent sidecar not found: {runner}")
 
@@ -88,7 +87,6 @@ class PiOptimizationBridge:
                     "max_turns": self.max_turns,
                     "context": self.context,
                     "tools": self.tool_definitions,
-                    "tool_server_mode": self.tool_server_mode,
                     "model": {
                         "base_url": os.getenv("LENSBOT_OPENAI_BASE_URL", ""),
                         "api_key": os.getenv("LENSBOT_OPENAI_API_KEY", ""),
@@ -124,11 +122,12 @@ class PiOptimizationBridge:
                     stderr_thread.join(timeout=1)
                     self._close_output_pipes(process)
                     return PiBridgeResult(
-                        ok=True,
+                        ok=not bool(data.get("error")),
                         session_id=str(data.get("session_id") or ""),
                         message_count=int(data.get("message_count") or 0),
-                        final_state=data.get("state") if isinstance(data.get("state"), dict) else {},
+                        final_state=data.get("state") if isinstance(data.get("state"), dict) else self._last_state,
                         events=self._events,
+                        error=str(data.get("error") or ""),
                     )
                 elif message_type == "error":
                     error = str(message.get("error") or "pi-agent sidecar failed")
@@ -139,11 +138,18 @@ class PiOptimizationBridge:
             self._close_output_pipes(process)
             if exit_code != 0:
                 raise PiBridgeError(f"pi-agent sidecar exited with code {exit_code}")
-            return PiBridgeResult(ok=True, events=self._events)
-        except Exception:
+            raise PiBridgeError("pi-agent sidecar exited without a completion result")
+        except Exception as exc:
             if process.poll() is None:
                 process.kill()
-            raise
+            process.wait(timeout=10)
+            stderr_thread.join(timeout=1)
+            self._close_stdin(process)
+            self._close_output_pipes(process)
+            return PiBridgeResult(
+                ok=False, final_state=self._last_state, events=self._events,
+                error=str(exc),
+            )
 
     def _send(self, process: subprocess.Popen[str], message: JsonObject) -> None:
         if process.stdin is None:
@@ -171,6 +177,10 @@ class PiOptimizationBridge:
     def _record_event(self, event: JsonObject) -> None:
         if not isinstance(event, dict):
             return
+        state = event.get("state")
+        if isinstance(state, dict):
+            self._last_state = state
+        event = {key: value for key, value in event.items() if key != "state"}
         self._events.append(event)
         if self.on_event:
             self.on_event(event)

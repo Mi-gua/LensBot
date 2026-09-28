@@ -9,7 +9,7 @@ from typing import Any
 from agent.llm import OpenAIExtractor
 from agent.prompts import workflow_agent_context, workflow_agent_prompt
 from runtime.traces import trace_row as _trace_row
-from subagents.types import LensDesignParams, SeedCandidate, clone_params, public_params_dict, target_params_dict
+from subagents.types import LensDesignParams, SeedCandidate, clone_params, design_contract_dict, target_params_dict
 
 
 class SeedingNode:
@@ -24,12 +24,12 @@ class SeedingNode:
             return
 
         available_tools = runtime.tool_names("retrieve_seed_cases", "read_seed_cases")
-        objective = "Select and validate an initial optical seed."
+        objective = "Prepare candidate optical structures for the optimization agent."
         agent_context = workflow_agent_context(
             agent_name=self.name,
             objective=objective,
             memory=ctx.memory_snapshot,
-            params=ctx.params,
+            params=_seed_target_payload(ctx.params),
             references=ctx.references,
         )
         system_prompt = workflow_agent_prompt(
@@ -42,6 +42,15 @@ class SeedingNode:
 
         if not ctx.references:
             result = self._seed_from_references(ctx, runtime, system_prompt)
+            if ctx.delivery_status == "failed" and self.planner.extractor.last_error:
+                extractor = self.planner.extractor
+                runtime.record_workflow_artifact(ctx, self.name, "llm_failure", {
+                    "error": extractor.last_error,
+                    "model": extractor.model,
+                    "finish_reason": extractor.last_finish_reason,
+                    "usage": extractor.last_usage,
+                    "content": extractor.last_content,
+                })
             trace.append(
                 _trace_row(
                     agent=self.name,
@@ -52,37 +61,13 @@ class SeedingNode:
                     observation=result["observation"],
                     data=result.get("data", {}),
                     done=bool(result.get("done", False)),
+                    ok=ctx.delivery_status != "failed",
                 )
             )
-        if not trace or not trace[-1].get("done"):
-            selected = next((item for item in ctx.references if item.get("selected")), None)
-            if selected and selected.get("applied"):
-                message = (
-                    f"Seed accepted from {selected.get('case_id')} after "
-                    f"{len([item for item in ctx.seed_candidates if item.inspected])} candidate inspection(s)."
-                )
-            elif selected:
-                message = (
-                    f"Reference {selected.get('case_id')} was inspected but not applied; "
-                    f"using current {len(ctx.params.surf_list)} surface groups."
-                )
-            else:
-                message = f"No reference seed applied; using current {len(ctx.params.surf_list)} surface groups."
-            trace.append(
-                _trace_row(
-                    agent=self.name,
-                    turn=len(trace),
-                    thought="Check whether the selected seed is ready for optimization.",
-                    action="confirm_seed",
-                    action_input={},
-                    observation=message,
-                    done=True,
-                )
-            )
-
         ctx.agent_trace.extend(trace)
         runtime.record_agent_trace(ctx, trace)
-        _record_seed_selection_memory(ctx, runtime)
+        if ctx.delivery_status != "failed":
+            _record_seed_selection_memory(ctx, runtime)
 
     def _seed_from_references(self, ctx: Any, runtime: Any, system_prompt: str) -> dict[str, Any]:
         retrieve_result = runtime.registry.call(
@@ -90,6 +75,7 @@ class SeedingNode:
             ctx=runtime.tool_context(ctx, agent_name=self.name, system_prompt=system_prompt),
         )
         if not retrieve_result.ok:
+            ctx.fail(retrieve_result.message)
             return {
                 "thought": "Reference retrieval failed.",
                 "observation": retrieve_result.message,
@@ -99,50 +85,50 @@ class SeedingNode:
         retrieve_data = retrieve_result.data if isinstance(retrieve_result.data, dict) else {}
         candidates = _seed_candidates_from_payload(retrieve_data.get("candidates", []), ctx.params)
         if not candidates:
+            ctx.fail("镜头库没有可用参考案例。")
             return {
                 "thought": "No local reference candidates are available.",
                 "observation": "No local ZEMAX seed candidates were available.",
                 "done": True,
             }
 
-        selected_ids = self.planner.select_candidates(
+        shortlist_ids = self.planner.shortlist_candidates(
             ctx.params,
             user_prompt=ctx.request.prompt or "",
             candidates=candidates,
             system_prompt=system_prompt,
         )
-        selected_ids = _fill_candidate_ids(selected_ids, candidates, limit=3)
-        selected_candidates = _selected_candidates(candidates, selected_ids)
+        shortlist = _candidates_by_id(candidates, shortlist_ids)
+        if not shortlist:
+            ctx.fail(_planner_error(self.planner) or "未选出候选参考案例。")
+            return {"thought": "Select reference cases.", "observation": ctx.failure_summary, "done": True}
         runtime.emit_event(
             ctx,
             "seeding.candidates.enter",
-            count=len(selected_candidates),
-            case_ids=_case_ids_text(selected_candidates),
+            count=len(shortlist),
+            case_ids=_case_ids_text(shortlist),
         )
 
-        selected_seed = deepcopy(ctx.params)
-        selected_case_id = ""
-        if selected_candidates:
-            runtime.emit_event(
-                ctx,
-                "seeding.cases.reading",
-                count=len(selected_candidates),
-                case_ids=_case_ids_text(selected_candidates),
-            )
+        runtime.emit_event(
+            ctx,
+            "seeding.cases.reading",
+            count=len(shortlist),
+            case_ids=_case_ids_text(shortlist),
+        )
 
         read_result = runtime.registry.call(
             "read_seed_cases",
             ctx=runtime.tool_context(ctx, agent_name=self.name, system_prompt=system_prompt),
-            cases=[_case_read_request(candidate) for candidate in selected_candidates],
+            cases=[_case_read_request(candidate) for candidate in shortlist],
         )
         read_data = read_result.data if isinstance(read_result.data, dict) else {}
         read_rows = [row for row in read_data.get("cases", []) if isinstance(row, dict)]
         read_errors = [row for row in read_data.get("errors", []) if isinstance(row, dict)]
         read_by_key = _rows_by_candidate_or_case(read_rows)
-        _record_read_errors(selected_candidates, read_errors)
+        _record_read_errors(shortlist, read_errors)
 
         case_payloads: list[dict[str, Any]] = []
-        for candidate in selected_candidates:
+        for candidate in shortlist:
             candidate.inspected = True
             row = _row_for_candidate(read_by_key, candidate)
             if row is None:
@@ -152,7 +138,7 @@ class SeedingNode:
 
         learned: dict[str, Any] = {}
         if case_payloads:
-            runtime.emit_event(ctx, "seeding.initializations.generating", count=len(case_payloads))
+            runtime.emit_event(ctx, "seeding.initialization.selecting", count=len(case_payloads))
             learned = self.planner.propose_initializations(
                 ctx.params,
                 user_prompt=ctx.request.prompt or "",
@@ -160,92 +146,42 @@ class SeedingNode:
                 system_prompt=system_prompt,
             )
 
-        proposal_items = _initialization_items(learned)
-        proposals_by_key = _rows_by_candidate_or_case(proposal_items)
-        preferred_case_id = str(learned.get("preferred_case_id") or learned.get("case_id") or "").strip()
-        fallback_case_id = ""
-
-        for candidate in selected_candidates:
-            proposal = _row_for_candidate(proposals_by_key, candidate)
-            candidate_params = deepcopy(ctx.params)
-            fallback_used = False
-            if proposal is not None:
-                candidate.applied = self.planner.apply_proposal(candidate_params, proposal)
-            if not candidate.applied:
-                fallback = _local_initialization_fallback(candidate, _row_for_candidate(read_by_key, candidate))
-                if fallback:
-                    candidate_params = deepcopy(ctx.params)
-                    candidate.applied = self.planner.apply_proposal(candidate_params, fallback)
-                    if candidate.applied:
-                        proposal = fallback
-                        fallback_used = True
-
-            if candidate.applied:
-                candidate.params = candidate_params
-                if fallback_used:
-                    candidate.risks.append(str(proposal.get("rationale") or "已根据参考案例生成本地初始结构。"))
-                else:
-                    candidate.risks.append(str(proposal.get("rationale") or "Accepted DeepLens initialization."))
-                if not fallback_case_id:
-                    fallback_case_id = candidate.case_id
-            elif proposal is None:
-                candidate.risks.append("LLM did not return an initialization for this case.")
-            elif proposal:
-                candidate.risks.append("LLM initialization did not pass DeepLens surface validation.")
-            else:
-                candidate.risks.append(_planner_error(self.planner) or "LLM did not return a parseable initialization.")
-
-        selected_case_id = _selected_applied_case_id(selected_candidates, preferred_case_id) or fallback_case_id
-        if selected_case_id:
-            selected = next(candidate for candidate in selected_candidates if candidate.case_id == selected_case_id)
-            if selected.params is not None:
-                selected_seed = deepcopy(selected.params)
-
-        references = [_reference_payload(candidate, selected_case_id=selected_case_id) for candidate in selected_candidates]
-
-        ctx.params = selected_seed
-        ctx.references.extend(references)
-        ctx.seed_candidates = candidates
-        runtime.publish_references(ctx.references)
-
-        applied = len([candidate for candidate in selected_candidates if candidate.applied])
-        if selected_case_id:
-            status = f"已选择 {selected_case_id}"
-            observation = (
-                f"已选择 {len(selected_candidates)} 个候选、读取 {len(case_payloads)} 个案例，"
-                f"生成 {applied} 个可用初始结构，并已选择 {selected_case_id}。"
-            )
-        else:
-            status = "继续使用当前默认初始结构"
-            observation = (
-                f"已选择 {len(selected_candidates)} 个候选、读取 {len(case_payloads)} 个案例，"
-                "但未生成可用初始结构；继续使用当前默认初始结构。"
-            )
-        runtime.emit_event(ctx, "seeding.initializations.done", applied=applied, count=len(selected_candidates), status=status)
-        runtime.emit_event(ctx, "seeding.references.published")
-        return {
-            "thought": "Retrieve local references from the index, read selected cases in batch, and generate initial structures.",
-            "observation": observation,
-            "data": {
-                "candidate_count": len(candidates),
-                "selected_count": len(selected_candidates),
-                "read_count": len(case_payloads),
-                "applied_count": applied,
-                "selected_case_id": selected_case_id,
-            },
+        proposals = {
+            str(item.get("candidate_id")): item
+            for item in learned.get("initial_structures", [])
+            if isinstance(item, dict)
         }
+        for candidate in shortlist:
+            proposal = proposals.get(candidate.candidate_id)
+            if proposal is None:
+                continue
+            params = deepcopy(ctx.params)
+            if self.planner.apply_proposal(params, proposal):
+                candidate.params = params
+                candidate.risks.extend(_proposal_notes(proposal))
 
+        ctx.seed_candidates = shortlist
+        ctx.references.extend(_reference_payload(candidate, selected_case_id="") for candidate in shortlist)
+        runtime.publish_references(ctx.references)
+        ready = sum(candidate.params is not None for candidate in shortlist)
+        if not ready:
+            ctx.fail(_planner_error(self.planner) or "未生成可供 DeepLens 使用的候选结构。")
+        else:
+            runtime.emit_event(ctx, "seeding.initialization.ready", count=ready)
+        return {
+            "thought": "Prepare reference structures for the optimization agent to choose from.",
+            "observation": ctx.failure_summary if not ready else f"已整理 {ready} 个可用候选结构，由优化智能体选择起点。",
+            "data": {"candidate_count": len(shortlist), "ready_count": ready},
+            "done": True,
+        }
 
 class SeedPlanner:
     _VALID_SURFACES = {"Spheric", "Aspheric", "Aperture", "ThinLens"}
-    _DEEPLENS_ARGS = {"foclen", "fov", "fnum", "bfl", "thickness", "surf_list"}
-    _CURRICULUM_FIELDS = {"iterations", "test_per_iter", "num_ring", "num_arm", "spp"}
-    _FINE_TUNE_FIELDS = {"iterations", "test_per_iter", "num_ring", "num_arm", "spp"}
 
     def __init__(self) -> None:
         self.extractor = OpenAIExtractor()
 
-    def select_candidates(
+    def shortlist_candidates(
         self,
         params: LensDesignParams,
         *,
@@ -256,7 +192,7 @@ class SeedPlanner:
         payload = {
             "task": "select_seed_candidates",
             "user_request": user_prompt,
-            "target": public_params_dict(params),
+            "target": _seed_target_payload(params),
             "instruction": "Pick 3 cases from the Markdown index. Return candidates with candidate_id and a short reason.",
             "candidates": [_candidate_brief(candidate) for candidate in candidates],
         }
@@ -289,40 +225,46 @@ class SeedPlanner:
         cases: list[dict[str, Any]],
         system_prompt: str,
     ) -> dict[str, Any]:
-        prompt = json.dumps(
-            {
-                "task": "propose_deeplens_initializations",
-                "user_request": user_prompt,
-                "target": public_params_dict(params),
-                "instruction": (
-                    "Return exactly one initial_structures item for each selected case. "
-                    "Preserve case_id and candidate_id. Pick preferred_case_id from the selected cases."
-                ),
-                "selected_cases": cases,
-            },
-            ensure_ascii=False,
-        )
-        return self.extractor.extract_json(prompt, system_prompt) or {}
+        structures: list[dict[str, Any]] = []
+        for case in cases:
+            prompt = json.dumps(
+                {
+                    "task": "prepare_deeplens_seeds",
+                    "user_request": user_prompt,
+                    "target": _seed_target_payload(params),
+                    "instruction": (
+                        "Return initial_structures with exactly one item for the supplied case. "
+                        "Include candidate_id, case_id, deeplens_args.surf_list, rationale and "
+                        "structure_derivation. Keep the evidence concise; do not repeat the source "
+                        "prescription or input context. The optimization agent chooses which to optimize."
+                    ),
+                    "selected_cases": [case],
+                },
+                ensure_ascii=False,
+            )
+            result = self.extractor.extract_json(prompt, system_prompt)
+            if result is None:
+                return {}
+            items = result.get("initial_structures")
+            if (not isinstance(items, list) or len(items) != 1
+                    or not isinstance(items[0], dict)
+                    or items[0].get("candidate_id") != case.get("candidate_id")):
+                self.extractor.last_error = "Expected one initialization for the supplied candidate."
+                return {}
+            structures.append(items[0])
+        return {"initial_structures": structures}
 
     def apply_proposal(self, params: LensDesignParams, proposal: dict[str, Any]) -> bool:
-        applied = False
-        deeplens_args = proposal.get("deeplens_args", {})
-        if not isinstance(deeplens_args, dict):
-            deeplens_args = {}
+        args = proposal.get("deeplens_args")
+        if not isinstance(args, dict):
+            return False
+        surf_list = self.normalize_surf_list(args.get("surf_list"))
+        if not surf_list:
+            return False
+        params.surf_list = surf_list
+        return True
 
-        for key in self._DEEPLENS_ARGS:
-            value = deeplens_args.get(key)
-            if key == "surf_list":
-                surf_list = self.normalize_surf_list(value)
-                if surf_list:
-                    params.surf_list = surf_list
-                    applied = True
-            elif key in {"foclen", "fov", "fnum", "bfl", "thickness"}:
-                continue
 
-        applied = self._apply_stage(params.curriculum, proposal.get("curriculum"), self._CURRICULUM_FIELDS) or applied
-        applied = self._apply_stage(params.fine_tune, proposal.get("fine_tune"), self._FINE_TUNE_FIELDS) or applied
-        return applied
 
     @classmethod
     def normalize_surf_list(cls, value: Any) -> list[list[str]]:
@@ -347,33 +289,6 @@ class SeedPlanner:
                 return []
         return normalized
 
-    @staticmethod
-    def _apply_stage(stage: Any, values: Any, allowed_fields: set[str]) -> bool:
-        if not isinstance(values, dict):
-            return False
-
-        applied = False
-        for key, value in values.items():
-            if key not in allowed_fields or not hasattr(stage, key):
-                continue
-            current = getattr(stage, key)
-            if isinstance(current, bool) and isinstance(value, bool):
-                setattr(stage, key, value)
-                applied = True
-            elif isinstance(current, bool):
-                continue
-            elif isinstance(current, int) and isinstance(value, (int, float)) and value > 0:
-                setattr(stage, key, int(value))
-                applied = True
-            elif isinstance(current, float) and isinstance(value, (int, float)) and value >= 0:
-                setattr(stage, key, float(value))
-                applied = True
-            elif isinstance(current, list) and isinstance(value, list) and all(isinstance(item, (int, float)) for item in value):
-                setattr(stage, key, [float(item) for item in value])
-                applied = True
-        return applied
-
-
 def _record_seed_selection_memory(ctx: Any, runtime: Any) -> None:
     try:
         runtime.memory.record_seed_selection_lessons(
@@ -387,23 +302,40 @@ def _record_seed_selection_memory(ctx: Any, runtime: Any) -> None:
         runtime.emit_event(ctx, "workflow.memory.skipped", error=exc)
 
 
-def _fill_candidate_ids(selected_ids: list[str], candidates: list[SeedCandidate], *, limit: int) -> list[str]:
-    filled = []
-    known = {candidate.candidate_id for candidate in candidates}
-    for candidate_id in selected_ids:
-        if candidate_id in known and candidate_id not in filled:
-            filled.append(candidate_id)
-        if len(filled) >= limit:
-            return filled
-    for candidate in candidates:
-        if candidate.candidate_id not in filled:
-            filled.append(candidate.candidate_id)
-        if len(filled) >= limit:
-            break
-    return filled
+def _proposal_notes(proposal: dict[str, Any]) -> list[str]:
+    notes: list[str] = []
+    rationale = str(proposal.get("rationale") or "").strip()
+    if rationale:
+        notes.append(rationale)
+    derivation = proposal.get("structure_derivation")
+    if isinstance(derivation, dict) and derivation:
+        notes.append("structure_derivation=" + json.dumps(derivation, ensure_ascii=False, sort_keys=True))
+    for key in ("caveats", "risks"):
+        value = proposal.get(key)
+        if isinstance(value, list):
+            notes.extend(str(item) for item in value if item)
+        elif value:
+            notes.append(str(value))
+    return notes or ["Accepted DeepLens initialization."]
 
 
-def _selected_candidates(candidates: list[SeedCandidate], selected_ids: list[str]) -> list[SeedCandidate]:
+def _seed_target_payload(params: LensDesignParams | None) -> dict[str, Any] | None:
+    if params is None:
+        return None
+    return {
+        "foclen": params.foclen,
+        "fov": params.fov,
+        "fnum": params.fnum,
+        "bfl": params.bfl,
+        "thickness": params.thickness,
+        "design_contract": design_contract_dict(params),
+    }
+
+
+
+
+
+def _candidates_by_id(candidates: list[SeedCandidate], selected_ids: list[str]) -> list[SeedCandidate]:
     by_id = {candidate.candidate_id: candidate for candidate in candidates}
     selected: list[SeedCandidate] = []
     for candidate_id in selected_ids:
@@ -459,88 +391,7 @@ def _record_read_errors(candidates: list[SeedCandidate], errors: list[dict[str, 
             candidate.risks.append(str(row.get("message") or "Seed case could not be read."))
 
 
-def _local_initialization_fallback(candidate: SeedCandidate, row: dict[str, Any] | None) -> dict[str, Any]:
-    if row is None:
-        return {}
-    metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
-    surf_list = _surf_list_from_case_metadata(metadata)
-    if not surf_list:
-        return {}
-    return {
-        "candidate_id": candidate.candidate_id,
-        "case_id": candidate.case_id,
-        "deeplens_args": {"surf_list": surf_list},
-        "curriculum": {},
-        "fine_tune": {},
-        "rationale": "LLM 初始化不可用，已根据参考案例的表面数量和孔径位置生成本地初始结构。",
-    }
 
-
-def _surf_list_from_case_metadata(metadata: dict[str, Any]) -> list[list[str]]:
-    surface_count = _metadata_int(metadata, "surface_count")
-    if surface_count <= 0:
-        return []
-    group_sizes = _valid_lens_group_sizes(max(2, surface_count))
-    surface_total = sum(group_sizes)
-    surfaces = ["Spheric"] * surface_total
-
-    asphere_count = max(0, min(surface_total, _metadata_int(metadata, "asphere_count")))
-    for index in range(surface_total - asphere_count, surface_total):
-        surfaces[index] = "Aspheric"
-
-    groups: list[list[str]] = []
-    boundaries = [0]
-    offset = 0
-    for size in group_sizes:
-        groups.append(surfaces[offset : offset + size])
-        offset += size
-        boundaries.append(offset)
-
-    stop_index = _metadata_int(metadata, "stop_index")
-    target = max(0, min(surface_total, stop_index - 1)) if stop_index > 0 else surface_total // 2
-    insert_at = min(range(len(boundaries)), key=lambda index: (abs(boundaries[index] - target), index))
-    return groups[:insert_at] + [["Aperture"]] + groups[insert_at:]
-
-
-def _valid_lens_group_sizes(surface_count: int) -> list[int]:
-    remaining = max(2, surface_count)
-    sizes: list[int] = []
-    while remaining > 0:
-        if remaining in {2, 3}:
-            sizes.append(remaining)
-            break
-        if remaining == 4:
-            sizes.extend([2, 2])
-            break
-        size = 2 if remaining - 3 == 1 else 3
-        sizes.append(size)
-        remaining -= size
-    return sizes
-
-
-def _metadata_int(metadata: dict[str, Any], key: str) -> int:
-    try:
-        return int(metadata.get(key) or 0)
-    except (TypeError, ValueError):
-        return 0
-
-
-def _initialization_items(result: dict[str, Any]) -> list[dict[str, Any]]:
-    raw = result.get("initial_structures") or result.get("structures") or result.get("candidates")
-    if isinstance(raw, dict):
-        raw = [raw]
-    if not isinstance(raw, list):
-        return []
-    return [item for item in raw if isinstance(item, dict)]
-
-
-def _selected_applied_case_id(candidates: list[SeedCandidate], preferred_case_id: str) -> str:
-    if not preferred_case_id:
-        return ""
-    return next(
-        (candidate.case_id for candidate in candidates if candidate.case_id == preferred_case_id and candidate.applied),
-        "",
-    )
 
 
 def _planner_error(planner: Any) -> str:
@@ -580,14 +431,6 @@ def _params_from_public(value: Any, base_params: LensDesignParams) -> LensDesign
     surf_list = value.get("surf_list")
     if isinstance(surf_list, list) and surf_list:
         params.surf_list = surf_list
-    for stage_name in ("curriculum", "fine_tune"):
-        stage_values = value.get(stage_name)
-        stage = getattr(params, stage_name)
-        if not isinstance(stage_values, dict):
-            continue
-        for key in ("iterations", "test_per_iter", "num_ring", "num_arm", "spp"):
-            if key in stage_values:
-                setattr(stage, key, int(stage_values[key]))
     return params
 
 

@@ -1,6 +1,33 @@
+# Credentials and local configuration
+.env
+.env.*
+!.env.example
+auth.json
+*.pem
+*.key
+
+# Python / Node dependencies and generated files
 __pycache__/
 *.py[cod]
-.cache/
-results/
+.venv/
+venv/
 node_modules/
+dist/
+build/
+*.egg-info/
+
+# Caches, logs and editor files
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 coverage/
+*.log
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Generated runs; curated files already tracked in Git remain versioned.
+/results/
+/src/memory/designrun/

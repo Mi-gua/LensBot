@@ -35,11 +35,32 @@ LENS_PARAMS_SCHEMA = {
     "properties": {
         "exp_name": {"type": "string"},
         "seed": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
-        "foclen": {"type": "number"},
-        "fov": {"type": "number"},
-        "fnum": {"type": "number"},
-        "bfl": {"type": "number"},
-        "thickness": {"type": "number"},
+        "lr_scale": {
+            "type": "number",
+            "minimum": 0.1,
+            "maximum": 10.0,
+            "description": "Initial multiplier applied to the canonical DeepLens learning rates.",
+        },
+        "foclen": {
+            "type": "number",
+            "description": "Target effective focal length in millimeters.",
+        },
+        "fov": {
+            "type": "number",
+            "description": "Target diagonal full field of view in degrees.",
+        },
+        "fnum": {
+            "type": "number",
+            "description": "Target working F-number.",
+        },
+        "bfl": {
+            "type": "number",
+            "description": "Initial back focal length used to construct the starting geometry.",
+        },
+        "thickness": {
+            "type": "number",
+            "description": "Initial first-surface-to-sensor total track used to construct the starting geometry.",
+        },
         "surf_list": {
             "type": "array",
             "items": {
@@ -48,14 +69,23 @@ LENS_PARAMS_SCHEMA = {
                 "minItems": 1,
             },
         },
+        "imgh": {
+            "type": "number",
+            "description": "Sensor half-diagonal in millimeters, retained for evaluation; initialization uses foclen and fov.",
+        },
         "curriculum": OPTIMIZATION_STAGE_SCHEMA,
+        "fine_tune": OPTIMIZATION_STAGE_SCHEMA,
+        "_meta": {
+            "type": "object",
+            "description": "Runtime-owned provenance and constraint metadata; agent proposals are ignored.",
+        },
     },
 }
 
 
 class DeepLensCurriculumTool:
     name = "deeplens_curriculum"
-    description = "Run DeepLens curriculum learning for one lens design candidate."
+    description = "Start a new DeepLens session and run curriculum optimization for one lens candidate."
     category = "algorithm"
     scope = "optimization"
     input_schema = {
@@ -63,9 +93,13 @@ class DeepLensCurriculumTool:
         "required": ["params"],
         "additionalProperties": False,
         "properties": {
+            "seed_candidate_id": {
+                "type": "string",
+                "description": "Choose a supplied initial_structures candidate. Its surf_list is used for this new session; omit for a custom structure.",
+            },
             "params": {
                 **LENS_PARAMS_SCHEMA,
-                "description": "Public LensDesignParams object for this candidate.",
+                "description": "Runnable LensDesignParams for a new session. Stage settings are starting guidance and may be overridden by the corresponding call.",
             },
         },
     }
@@ -80,9 +114,23 @@ class DeepLensCurriculumTool:
             "curriculum_json": {"type": "string"},
             "curriculum_iter": {"type": "integer"},
             "curriculum_total": {"type": "integer"},
+            "iterations_requested": {"type": "integer"},
+            "iterations_executed": {"type": "integer"},
+            "source_lens": {"type": "string"},
+            "optimizer_reinitialized": {"type": "boolean"},
         },
     }
-    metadata = {"engine": "deeplens", "kind": "curriculum"}
+    metadata = {
+        "engine": "deeplens",
+        "kind": "curriculum",
+        "pi": {
+            "prompt_snippet": (
+                "Start or restart DeepLens curriculum optimization from trusted LensDesignParams. "
+                "Use it to create a coarse viable baseline or to test a justified params_override. "
+                "This creates a new session/result path; use deeplens_finetune to continue from the resulting session or artifact."
+            )
+        },
+    }
 
     def run(self, ctx: ToolContext, **kwargs: Any) -> ToolResult:
         params = normalize_lens_params(ctx, kwargs.get("params"))
@@ -93,6 +141,15 @@ class DeepLensCurriculumTool:
                 error={"code": "invalid_params", "received_type": type(kwargs.get("params")).__name__},
             )
 
+        seed_id = kwargs.get("seed_candidate_id")
+        if seed_id:
+            candidate = next(
+                (item for item in ctx.agent_context.get("initial_structures", []) if item.get("candidate_id") == seed_id),
+                None,
+            )
+            if candidate is None:
+                return ToolResult.failure(f"Unknown seed candidate: {seed_id}", code="unknown_seed")
+            params.surf_list = candidate["params"]["surf_list"]
         result_dir = result_dir_for_run(ctx.project_root, ctx.agent_context.get("run_id"))
         session = DeepLensOptimizationSession(
             params=params,
@@ -103,7 +160,15 @@ class DeepLensCurriculumTool:
         with quiet_engine_output(result_dir):
             data = session.start()
             total = int(data.get("curriculum_total") or params.curriculum.iterations)
-            data = session.run_curriculum_chunk(total + 1)
+            before = int(data.get("curriculum_iter") or 0)
+            data = session.run_curriculum_chunk(total)
+        data.update({
+            "seed_candidate_id": seed_id,
+            "iterations_requested": total,
+            "iterations_executed": int(data.get("curriculum_iter") or 0) - before,
+            "source_lens": "generated_starting_point",
+            "optimizer_reinitialized": True,
+        })
 
         SESSIONS[session.session_id] = session
         return ToolResult.success(
@@ -130,6 +195,7 @@ def curriculum_observation(data: dict[str, Any]) -> str:
         f"session_id={data.get('session_id')}, "
         f"phase={data.get('phase')}, "
         f"curriculum_iter={data.get('curriculum_iter')}/{data.get('curriculum_total')}, "
+        f"iterations_executed={data.get('iterations_executed')}, "
         f"result_dir={data.get('result_dir')}, "
         f"curriculum_json={curriculum_json or 'not_ready'}, "
         f"has_curriculum_json={str(has_curriculum_json).lower()}."

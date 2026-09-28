@@ -1,0 +1,78 @@
+{
+  "mode": "nl",
+  "prompt": "T04：设计一支可见光 RGB 中焦成像镜头，用于无限远目标。要求有效焦距为 85 mm，对角全视场为 29°，F 数为 4.0，对应约 44.0 mm 的像面直径。初始后焦距设为 25 mm，初始总厚度设为 105 mm。",
+  "params": {
+    "exp_name": "Auto lens design",
+    "seed": null,
+    "foclen": 50.0,
+    "imgh": 19.69552378074712,
+    "fov": 43.0,
+    "fnum": 3.0,
+    "bfl": 18.0,
+    "thickness": 75.0,
+    "surf_list": [
+      [
+        "Spheric",
+        "Spheric"
+      ],
+      [
+        "Spheric",
+        "Spheric"
+      ],
+      [
+        "Spheric",
+        "Spheric",
+        "Spheric"
+      ],
+      [
+        "Aperture"
+      ],
+      [
+        "Spheric",
+        "Spheric",
+        "Spheric"
+      ],
+      [
+        "Spheric",
+        "Aspheric"
+      ],
+      [
+        "Spheric",
+        "Aspheric"
+      ]
+    ],
+    "lr_scale": 1.0,
+    "curriculum": {
+      "iterations": 2000,
+      "test_per_iter": 50,
+      "num_ring": 16,
+      "num_arm": 4,
+      "spp": 512
+    },
+    "fine_tune": {
+      "iterations": 5000,
+      "test_per_iter": 100,
+      "num_ring": 32,
+      "num_arm": 8,
+      "spp": 512
+    },
+    "_meta": {
+      "parameter_sources": {
+        "foclen": "suggested_default",
+        "fov": "suggested_default",
+        "fnum": "suggested_default",
+        "bfl": "suggested_default",
+        "thickness": "suggested_default",
+        "surf_list": "suggested_default",
+        "imgh": "derived"
+      },
+      "constraints": {},
+      "budget_sources": {
+        "curriculum": "suggested_default",
+        "fine_tune": "suggested_default"
+      }
+    }
+  },
+  "max_turns": null,
+  "recommended_max_turns": 50
+}

@@ -3,12 +3,11 @@ from __future__ import annotations
 """Optimization workflow node backed by the pi-native LensBot agent."""
 
 import json
-import os
-from datetime import datetime
 from typing import Any, Callable
 
 from runtime.bridge import PiBridgeError, PiOptimizationBridge
-from subagents.types import public_params_dict
+from runtime.result import new_run_id
+from subagents.types import RECOMMENDED_OPTIMIZATION_REVIEW_TURNS, design_contract_dict, public_params_dict
 from tools.deeplens.curriculum import result_dir_for_run
 
 
@@ -17,7 +16,7 @@ class OptimizationRunner:
 
     name = "Optimization"
     objective = (
-        "Use the available LensBot resources and optimization tools to produce the best valid lens for the target."
+        "Choose a starting structure from the supplied candidates and optimize it for the design contract. Decide from measured results whether to refine it or try another candidate; do not optimize every candidate by default."
     )
     tool_names = [
         "powershell",
@@ -30,12 +29,13 @@ class OptimizationRunner:
         "deeplens_inspect_checkpoint",
         "deeplens_adjust_strategy",
         "deeplens_analysis",
+        "deeplens_compare_candidates",
     ]
 
     def __init__(
         self,
         *,
-        max_turns: int = 24,
+        max_turns: int | None = None,
         emit: Callable[[str], None] | None = None,
         objective: str | None = None,
     ) -> None:
@@ -60,10 +60,9 @@ class OptimizationRunner:
             context=_optimization_context(ctx, run_id=run_id),
             tool_definitions=runtime.registry.describe(available_tools),
             objective=self.objective,
-            max_turns=self.max_turns,
+            max_turns=getattr(ctx.request, "max_turns", None) or self.max_turns,
             emit=self.emit,
             on_event=live_events.handle,
-            tool_server_mode=_tool_server_mode_from_env(),
         )
 
         try:
@@ -84,12 +83,19 @@ class OptimizationRunner:
             trace = _trace_from_events(result.events)
             ctx.agent_trace.extend(trace)
             ctx.metrics["optimization_trace"] = trace
-        _sync_final_state(ctx, runtime, result.final_state, failure_hint=_last_failure_hint(ctx, trace))
+        _sync_final_state(
+            ctx,
+            runtime,
+            result.final_state,
+            failure_hint=result.error,
+        )
+        if not result.ok and ctx.delivery_status != "failed":
+            ctx.fail(result.error or "Optimization process failed.")
 
 
 def _sync_final_state(ctx: Any, runtime: Any, state: dict[str, Any], *, failure_hint: str = "") -> None:
     if not state:
-        ctx.fail("pi optimization finished without a final state.")
+        ctx.fail(failure_hint or "pi optimization finished without a final state.")
         return
     recorder = getattr(runtime, "record_workflow_artifact", None)
     if callable(recorder):
@@ -103,23 +109,48 @@ def _sync_final_state(ctx: Any, runtime: Any, state: dict[str, Any], *, failure_
         ctx.design_result["result_dir"] = str(result_dir)
         runtime.publish_artifact(str(result_dir), ctx=ctx)
 
-    for key in ("curriculum_json", "analysis_json", "final_json", "final_zmx"):
+    for key in (
+        "curriculum_json",
+        "candidate_json",
+        "candidate_zmx",
+        "candidate_png",
+        "analysis_json",
+        "final_json",
+        "final_zmx",
+        "final_png",
+    ):
         value = artifacts.get(key)
         if value:
             ctx.design_result[key] = str(value)
 
     ctx.metrics.update(metrics)
+    execution_params = state.get("params_override") or {}
+    if ctx.params is not None and execution_params.get("surf_list"):
+        ctx.params.surf_list = execution_params["surf_list"]
+    active_seed_id = state.get("active_seed_id")
+    _publish_seed_selection(ctx, runtime, active_seed_id, applied=True)
     _promote_final_deeplens_metrics(ctx.metrics)
-    final_summary = str(state.get("final_summary") or "").strip()
-    if final_summary:
-        ctx.metrics["final_summary"] = final_summary
+    final_verdict = state.get("final_verdict")
+    if isinstance(final_verdict, dict):
+        ctx.metrics["agent_verdict"] = dict(final_verdict)
     if state.get("phase") != "finished":
-        suffix = f" Last tool failure: {failure_hint}" if failure_hint else ""
+        suffix = f" Reason: {failure_hint}" if failure_hint else ""
         ctx.fail(f"pi optimization stopped before finish: phase={state.get('phase')!r}.{suffix}")
         return
 
     if not ctx.design_result.get("final_json") or not ctx.design_result.get("final_zmx"):
         ctx.fail("pi optimization finished without final_json/final_zmx in state.")
+
+
+def _publish_seed_selection(ctx: Any, runtime: Any, seed_id: Any, *, applied: bool = False) -> None:
+    for candidate in ctx.seed_candidates:
+        if applied:
+            candidate.applied = bool(seed_id and candidate.candidate_id == seed_id)
+    for reference in ctx.references:
+        reference["selected"] = bool(seed_id and reference.get("candidate_id") == seed_id)
+        if applied:
+            reference["applied"] = reference["selected"]
+    runtime.publish_references([dict(reference) for reference in ctx.references])
 
 
 def _promote_final_deeplens_metrics(metrics: dict[str, Any]) -> None:
@@ -143,46 +174,26 @@ def _promote_final_deeplens_metrics(metrics: dict[str, Any]) -> None:
 def _optimization_context(ctx: Any, *, run_id: str | None = None) -> dict[str, Any]:
     return {
         "run_id": run_id or _run_id(ctx),
-        "target": public_params_dict(ctx.params),
-        "initial_structures": [_seed_candidate_payload(item) for item in _optimization_seed_candidates(ctx.seed_candidates)],
+        "execution_params": public_params_dict(ctx.params),
+        "design_contract": design_contract_dict(ctx.params),
+        "effort_policy": {
+            "explicit_tool_call_limit": getattr(ctx.request, "max_turns", None),
+            "recommended_review_point": getattr(ctx.request, "recommended_max_turns", RECOMMENDED_OPTIMIZATION_REVIEW_TURNS),
+            "meaning": "The review point is general guidance, not a required number of calls or an optimization budget.",
+        },
+        "initial_structures": [_seed_candidate_payload(item) for item in ctx.seed_candidates if item.params is not None],
         "memory": _optimization_memory(ctx.memory_snapshot),
     }
 
 
-def _last_failure_hint(ctx: Any, trace: list[dict[str, Any]]) -> str:
-    for row in reversed(trace):
-        tool_result = row.get("tool_result") if isinstance(row.get("tool_result"), dict) else {}
-        if tool_result.get("ok") is not False:
-            continue
-        tool_call = row.get("tool_call") if isinstance(row.get("tool_call"), dict) else {}
-        tool_name = str(tool_call.get("name") or row.get("action") or "tool")
-        observation = str(row.get("observation") or tool_result.get("observation") or "").strip()
-        if observation:
-            return f"{tool_name}: {observation}"
 
-    transcript = ctx.metrics.get("optimization_transcript") if isinstance(ctx.metrics, dict) else None
-    if isinstance(transcript, list):
-        for row in reversed(transcript):
-            if not isinstance(row, dict) or row.get("kind") != "assistant_message":
-                continue
-            text = " ".join(str(row.get("text") or "").split())
-            if text:
-                return text[:240]
-    return ""
 
 
 def _run_id(ctx: Any) -> str:
     existing = getattr(ctx, "run_id", "")
     if existing:
         return str(existing)
-    name = getattr(getattr(ctx, "params", None), "exp_name", "") or "lensbot-optimization"
-    prefix = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "-" for ch in str(name)).strip("-") or "lensbot-optimization"
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-    return f"{prefix}-{stamp}"
-
-
-def _tool_server_mode_from_env() -> str:
-    return "fake" if os.getenv("LENSBOT_TOOL_SERVER_MODE") == "fake" else "real"
+    return new_run_id()
 
 
 class _LivePiEventRecorder:
@@ -208,6 +219,7 @@ class _LivePiEventRecorder:
         self.current_message_turn: int | None = None
         self.current_message_text = ""
         self.sequence = 0
+        self.usage_by_turn: dict[int, dict[str, Any]] = {}
 
     def handle(self, event: dict[str, Any]) -> None:
         event_type = str(event.get("type") or "")
@@ -223,16 +235,23 @@ class _LivePiEventRecorder:
         if event_type == "tool_execution_end":
             self._handle_tool_end(event)
             return
-        if event_type == "agent_end":
-            row = _agent_end_turn(event, turn=len(self.trace))
-            self._store_transcript_event(
-                _agent_end_event(event, turn=len(self.trace), sequence=self.sequence),
-                self._current_or_predicted_result_dir(),
-            )
-            self._store_turn(row, self._current_result_dir())
+        if event_type == "turn_end":
+            self._handle_turn_end(event)
             return
         if event_type == "turn_start" and self.emit:
             self.emit("pi turn start")
+
+    def _handle_turn_end(self, event: dict[str, Any]) -> None:
+        usage = event.get("usage") if isinstance(event.get("usage"), dict) else {}
+        if not usage:
+            return
+        try:
+            turn_index = int(event.get("turn_index", len(self.usage_by_turn)))
+        except (TypeError, ValueError):
+            turn_index = len(self.usage_by_turn)
+        self.usage_by_turn[turn_index] = usage
+        totals = _aggregate_model_usage(self.usage_by_turn.values())
+        self.ctx.metrics.update(totals)
 
     def _handle_message_update(self, event: dict[str, Any]) -> None:
         if str(event.get("update_type") or "") != "text_delta":
@@ -257,7 +276,7 @@ class _LivePiEventRecorder:
             "delta": delta,
             **_native_event_projection(event),
         }
-        self._store_transcript_event(row, self._current_or_predicted_result_dir())
+        self._store_live_transcript_event(row)
 
     def _handle_tool_start(self, event: dict[str, Any]) -> None:
         tool_name = str(event.get("tool_name") or "")
@@ -268,6 +287,7 @@ class _LivePiEventRecorder:
         result_dir = self._current_result_dir()
         if tool_name == "deeplens_curriculum":
             args = event.get("args") if isinstance(event.get("args"), dict) else {}
+            _publish_seed_selection(self.ctx, self.runtime, args.get("seed_candidate_id"))
             result_dir = str(result_dir_for_run(self.runtime.project_root, str(args.get("run_id") or self.run_id)))
         self._store_turn(_tool_start_turn(event, turn=turn), result_dir)
         self._store_transcript_event(_tool_call_event(event, turn=turn, sequence=self.sequence), result_dir)
@@ -290,6 +310,14 @@ class _LivePiEventRecorder:
         key = _tool_event_key(event, len(self.trace))
         start_event, turn = self.pending_calls.pop(key, ({}, len(self.trace)))
         row = _tool_turn_from_events(start_event, event, turn=turn)
+        if (event.get("tool_name") or start_event.get("tool_name")) == "deeplens_curriculum":
+            result = _normalized_tool_result(event)
+            if result["ok"]:
+                patch = result.get("state_patch") or {}
+                _publish_seed_selection(self.ctx, self.runtime, patch.get("active_seed_id"), applied=True)
+            else:
+                active_seed_id = next((item.candidate_id for item in self.ctx.seed_candidates if item.applied), None)
+                _publish_seed_selection(self.ctx, self.runtime, active_seed_id)
         result_dir = _result_dir_from_tool_event(event) or self._current_result_dir()
         self._store_transcript_event(_tool_result_event(event, turn=turn, sequence=self.sequence), result_dir)
         self._store_turn(row, result_dir)
@@ -310,6 +338,23 @@ class _LivePiEventRecorder:
             self.runtime.bind_result_dir(self.ctx, result_dir)
             self._flush_transcript(result_dir)
             self.runtime.publish_artifact(result_dir, ctx=self.ctx)
+
+    def _store_live_transcript_event(self, row: dict[str, Any]) -> None:
+        row["sequence"] = row.get("sequence", self.sequence)
+        event_id = str(row.get("message_id") or row.get("tool_call_id") or row.get("sequence"))
+        for index, existing in enumerate(self.transcript):
+            existing_id = str(existing.get("message_id") or existing.get("tool_call_id") or existing.get("sequence"))
+            if existing.get("kind") == row.get("kind") and existing_id == event_id:
+                row["sequence"] = existing.get("sequence", row["sequence"])
+                self.transcript[index] = row
+                break
+        else:
+            self.sequence += 1
+            self.transcript.append(row)
+        self.ctx.metrics["optimization_transcript"] = list(self.transcript)
+        publisher = getattr(self.runtime, "publish_transcript", None)
+        if callable(publisher):
+            publisher(self.ctx, row)
 
     def _store_turn(self, row: dict[str, Any], result_dir: str | None) -> None:
         turn = int(row.get("turn") or 0)
@@ -358,10 +403,6 @@ class _LivePiEventRecorder:
             or None
         )
 
-    def _current_or_predicted_result_dir(self) -> str | None:
-        return self._current_result_dir() or str(result_dir_for_run(self.runtime.project_root, self.run_id))
-
-
 def _seed_candidate_payload(candidate: Any) -> dict[str, Any]:
     return {
         "candidate_id": candidate.candidate_id,
@@ -377,11 +418,36 @@ def _seed_candidate_payload(candidate: Any) -> dict[str, Any]:
     }
 
 
-def _optimization_seed_candidates(candidates: list[Any]) -> list[Any]:
-    prioritized = [candidate for candidate in candidates if candidate.applied or candidate.inspected]
-    if not prioritized:
-        prioritized = candidates
-    return prioritized[:3]
+
+
+
+def _aggregate_model_usage(rows: Any) -> dict[str, int]:
+    totals = {
+        "optimization_input_tokens": 0,
+        "optimization_output_tokens": 0,
+        "optimization_cache_read_tokens": 0,
+        "optimization_cache_write_tokens": 0,
+        "optimization_total_tokens": 0,
+    }
+    count = 0
+    mapping = {
+        "input": "optimization_input_tokens",
+        "output": "optimization_output_tokens",
+        "cacheRead": "optimization_cache_read_tokens",
+        "cacheWrite": "optimization_cache_write_tokens",
+        "totalTokens": "optimization_total_tokens",
+    }
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        count += 1
+        for source, target in mapping.items():
+            try:
+                totals[target] += int(row.get(source) or 0)
+            except (TypeError, ValueError):
+                continue
+    totals["optimization_model_turns"] = count
+    return totals
 
 
 def _optimization_memory(memory: dict[str, Any]) -> dict[str, Any]:
@@ -405,8 +471,6 @@ def _trace_from_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
             start_event = pending_calls.pop(key, {})
             trace.append(_tool_turn_from_events(start_event, event, turn=len(trace)))
             continue
-        if event_type == "agent_end":
-            trace.append(_agent_end_turn(event, turn=len(trace)))
     return trace
 
 
@@ -531,46 +595,6 @@ def _tool_result_event(event: dict[str, Any], *, turn: int, sequence: int) -> di
     summary = _decision_summary(event)
     if summary:
         row["thought"] = summary
-    timestamp = event.get("time") or event.get("timestamp")
-    if timestamp:
-        row["timestamp"] = timestamp
-    return row
-
-
-def _agent_end_turn(event: dict[str, Any], *, turn: int) -> dict[str, Any]:
-    observation = str(event.get("observation") or "Optimization agent finished.")
-    row = {
-        "agent": OptimizationRunner.name,
-        "turn": turn,
-        "thought": "Optimization agent ended the run.",
-        "tool_call": {"name": "agent_end", "arguments": {}},
-        "tool_result": {"ok": not bool(event.get("is_error")), "observation": observation, "data": event},
-        "observation": observation,
-        "done": True,
-        "action": "agent_end",
-        "action_input": {},
-        "data": event,
-    }
-    timestamp = event.get("time") or event.get("timestamp")
-    if timestamp:
-        row["timestamp"] = timestamp
-    return row
-
-
-def _agent_end_event(event: dict[str, Any], *, turn: int, sequence: int) -> dict[str, Any]:
-    observation = str(event.get("observation") or "Optimization agent finished.")
-    row = {
-        "agent": OptimizationRunner.name,
-        "kind": "agent_end",
-        "turn": turn,
-        "sequence": sequence,
-        "message_id": f"agent-end-{turn}",
-        "text": observation,
-        "observation": observation,
-        "ok": not bool(event.get("is_error")),
-        "done": True,
-        "data": event,
-    }
     timestamp = event.get("time") or event.get("timestamp")
     if timestamp:
         row["timestamp"] = timestamp

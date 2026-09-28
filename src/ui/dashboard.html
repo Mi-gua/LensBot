@@ -21,6 +21,7 @@
           <button type="button" data-view="run" class="active">&#24037;&#20316;&#21488;</button>
           <button type="button" data-view="process">&#20248;&#21270;</button>
           <button type="button" data-view="results">&#32467;&#26524;</button>
+          <button type="button" data-view="report">报告</button>
           <button type="button" data-view="config">&#37197;&#32622;</button>
         </nav>
         <div class="status-mini"><span class="dot"></span><span>&#20809;&#23398;&#35774;&#35745;&#21161;&#25163;</span></div>
@@ -34,7 +35,8 @@
             <button type="button" data-view="run" class="active"><span class="nav-index">01</span><span class="nav-label">&#24037;&#20316;&#21488;</span></button>
             <button type="button" data-view="process"><span class="nav-index">02</span><span class="nav-label">&#20248;&#21270;</span></button>
             <button type="button" data-view="results"><span class="nav-index">03</span><span class="nav-label">&#32467;&#26524;</span></button>
-            <button type="button" data-view="config"><span class="nav-index">04</span><span class="nav-label">&#37197;&#32622;</span></button>
+            <button type="button" data-view="report"><span class="nav-index">04</span><span class="nav-label">报告</span></button>
+            <button type="button" data-view="config"><span class="nav-index">05</span><span class="nav-label">&#37197;&#32622;</span></button>
           </div>
         </div>
       </aside>
@@ -77,31 +79,31 @@
                 <p class="section-label">&#20219;&#21153;&#25551;&#36848;</p>
                 <div id="nl-block">
                   <label for="nl_prompt">&#33258;&#28982;&#35821;&#35328;&#30446;&#26631;</label>
-                  <textarea id="nl_prompt">&#35831;&#20026;&#20840;&#30011;&#24133;&#30456;&#26426;&#35774;&#35745;&#19968;&#20010;&#26631;&#20934;&#38236;&#22836;&#65306;&#28966;&#36317; 52 mm&#65292;F/2.9&#65292;&#20840;&#35270;&#22330; 43 &#24230;&#65292;&#21518;&#28966;&#36317; 18 mm&#65292;&#24635;&#21402;&#24230;&#25511;&#21046;&#22312; 120 mm &#24038;&#21491;&#12290;&#20248;&#20808;&#20445;&#25345; EFL&#12289;FOV &#21644; F &#25968;&#25509;&#36817;&#30446;&#26631;&#65292;&#20854;&#27425;&#20248;&#21270;&#20013;&#24515;&#21644;&#36793;&#32536; RMS spot&#12289;&#30072;&#21464;&#21644; MTF&#12290;</textarea>
+                  <textarea id="nl_prompt">设计一个全画幅标准摄影镜头： 焦距 50 mm，F/3.0，全视场 43 度，后焦距 18 mm，总厚度约 75 mm。 优先保持 EFL、FOV 和 F 数等规格接近目标；其次优化中心、0.5 视场和边缘 RMS spot 。</textarea>
                 </div>
 
                 <div id="param-block" style="display:none;">
                   <div class="triple">
                     <div>
-                      <label for="foclen">&#28966;&#36317; (mm)</label>
+                      <label for="foclen">&#30446;&#26631;&#26377;&#25928;&#28966;&#36317; EFL (mm)</label>
                       <input id="foclen" type="number" step="0.1">
                     </div>
                     <div>
-                      <label for="fov">&#35270;&#22330; (deg)</label>
+                      <label for="fov">&#30446;&#26631;&#20840;&#35270;&#22330; FOV (deg)</label>
                       <input id="fov" type="number" step="0.1">
                     </div>
                     <div>
-                      <label for="fnum">F &#25968;</label>
+                      <label for="fnum">&#30446;&#26631; F &#25968;</label>
                       <input id="fnum" type="number" step="0.1">
                     </div>
                   </div>
                   <div class="row">
                     <div>
-                      <label for="bfl">&#21518;&#28966;&#36317; (mm)</label>
+                      <label for="bfl">&#21021;&#22987;&#21518;&#28966;&#36317; BFL (mm)</label>
                       <input id="bfl" type="number" step="0.1">
                     </div>
                     <div>
-                      <label for="thickness">&#24635;&#21402;&#24230; (mm)</label>
+                      <label for="thickness">&#21021;&#22987;&#24635;&#38271; TTL (mm)</label>
                       <input id="thickness" type="number" step="0.1">
                     </div>
                   </div>
@@ -212,9 +214,31 @@
           </div>
         </section>
 
+        <section class="page-view" id="view-report">
+          <section class="stage-card">
+            <div class="toolbar report-toolbar">
+              <div>
+                <p class="eyebrow">REPORTING</p>
+                <h2>光学镜头设计总结报告</h2>
+              </div>
+              <div class="report-actions">
+                <a class="secondary report-action disabled" id="report-open" href="#" target="_blank" rel="noreferrer" aria-disabled="true">新窗口查看</a>
+                <a class="primary report-action disabled" id="report-download" href="#" download="LensBot-optical-summary-report.html" aria-disabled="true">下载 HTML</a>
+              </div>
+            </div>
+            <div class="report-stage" id="report-stage">
+              <div class="empty-state empty-state--pending empty-state--fill">
+                <span class="empty-state-mark" aria-hidden="true"></span>
+                <span class="empty-state-title">等待运行</span>
+                <p>运行完成后，这里会显示光学镜头设计总结报告。</p>
+              </div>
+            </div>
+          </section>
+        </section>
+
         <section class="page-view" id="view-config">
           <div class="config-grid">
-            <section class="card control-card">
+            <section class="card control-card" id="api-config-panel">
               <div class="control-head">
                 <div>
                   <p class="eyebrow">API</p>
@@ -252,10 +276,23 @@
                     </div>
                   </div>
                 </div>
+                <div class="budget-group">
+                  <h4 class="stage-tag">&#26234;&#33021;&#20307;</h4>
+                  <div class="api-config-fields">
+                    <div>
+                      <label for="optimization_max_turns">&#26368;&#22823;&#24037;&#20855;&#35843;&#29992;&#27425;&#25968;</label>
+                      <input id="optimization_max_turns" type="number" step="1" min="1">
+                    </div>
+                  </div>
+                </div>
+              </div>
+            <div class="config-confirm">
+                <button class="primary" id="confirm-api-config" type="button">确认配置</button>
+                <span id="api-config-status" role="status">当前使用默认配置</span>
               </div>
             </section>
 
-            <section class="card control-card">
+            <section class="card control-card" id="engine-config-panel">
               <div class="control-head">
                 <div>
                   <p class="eyebrow">&#20248;&#21270;</p>
@@ -264,11 +301,25 @@
               </div>
               <div class="budget-grid">
                 <div class="budget-group">
+                  <h4 class="stage-tag">&#31639;&#27861;&#35774;&#32622;</h4>
+                  <div class="row stage-group">
+                    <div>
+                      <label for="engine_seed">&#38543;&#26426;&#31181;&#23376;</label>
+                      <input id="engine_seed" type="number" step="1" min="0" max="100000" placeholder="&#30041;&#31354;&#33258;&#21160;&#29983;&#25104;">
+                    </div>
+                    <div>
+                      <label for="engine_lr_scale">&#21021;&#22987;&#23398;&#20064;&#29575;&#20493;&#29575;</label>
+                      <input id="engine_lr_scale" type="number" step="0.1" min="0.1" max="10">
+                    </div>
+                  </div>
+                </div>
+
+                <div class="budget-group">
                   <h4 class="stage-tag">&#35838;&#31243;&#23398;&#20064;</h4>
                   <div class="triple stage-group">
                     <div>
                       <label for="iterations">&#36845;&#20195;&#36718;&#25968;</label>
-                      <input id="iterations" type="number" step="1" min="1" value="3000">
+                      <input id="iterations" type="number" step="1" min="1" value="2000">
                     </div>
                     <div>
                       <label for="spp">&#37319;&#26679;&#25968;</label>
@@ -296,7 +347,7 @@
                   <div class="triple stage-group">
                     <div>
                       <label for="fine_tune_iterations">&#24494;&#35843;&#36718;&#27425;</label>
-                      <input id="fine_tune_iterations" type="number" step="1" min="1" value="2000">
+                      <input id="fine_tune_iterations" type="number" step="1" min="1" value="5000">
                     </div>
                     <div>
                       <label for="fine_tune_spp">&#37319;&#26679;&#25968;</label>
@@ -318,6 +369,10 @@
                     </div>
                   </div>
                 </div>
+              </div>
+            <div class="config-confirm">
+                <button class="primary" id="confirm-engine-config" type="button">确认配置</button>
+                <span id="engine-config-status" role="status">当前使用默认配置</span>
               </div>
             </section>
           </div>

@@ -161,21 +161,19 @@ def _row_payload(row: Any) -> dict[str, Any]:
         "turn": row.get("turn"),
         "thought": row.get("thought"),
         "tool": tool_name,
-        "arguments": arguments,
-        "tool_call": {"name": tool_name, "arguments": arguments},
-        "tool_result": tool_result,
-        "observation": row.get("observation") or tool_result.get("observation"),
+        "arguments": _bounded_value(arguments),
+        "tool_call": {"name": tool_name, "arguments": _bounded_value(arguments)},
+        "tool_result": _compact_tool_result(tool_result),
+        "observation": _summary_text(row.get("observation") or tool_result.get("observation"), 1200),
         "ok": tool_result.get("ok", row.get("ok")),
         "done": row.get("done"),
-        "artifacts": tool_result.get("artifacts", row.get("artifacts", [])),
-        "metrics": tool_result.get("metrics", row.get("metrics", {})),
-        "error": tool_result.get("error", row.get("error")),
+        "artifacts": _compact_artifacts(tool_result.get("artifacts", row.get("artifacts", []))),
+        "metrics": _scalar_values(tool_result.get("metrics", row.get("metrics", {}))),
+        "error": _bounded_value(tool_result.get("error", row.get("error")), 1500),
     }
     for key in ("duration_ms", "timestamp"):
         if row.get(key) is not None:
             payload[key] = row.get(key)
-    if row.get("data") is not None:
-        payload["data"] = row.get("data")
     return payload
 
 
@@ -207,7 +205,6 @@ def _native_transcript_payload(row: dict[str, Any]) -> dict[str, Any]:
         "metrics",
         "artifacts",
         "error",
-        "data",
         "status",
         "source_event_type",
         "assistant_event_type",
@@ -216,11 +213,96 @@ def _native_transcript_payload(row: dict[str, Any]) -> dict[str, Any]:
         "update_type",
         "delta_length",
         "stop_reason",
-        "partial_result",
     ):
         if row.get(key) is not None:
             payload[key] = row.get(key)
+    if "text" in payload:
+        payload["text"] = _summary_text(payload["text"], 4000)
+    if "delta" in payload:
+        payload["delta"] = _summary_text(payload["delta"], 4000)
+    if "arguments" in payload:
+        payload["arguments"] = _bounded_value(payload["arguments"])
+    if isinstance(payload.get("tool_call"), dict):
+        call = payload["tool_call"]
+        payload["tool_call"] = {
+            "name": call.get("name") or row.get("tool"),
+            "arguments": _bounded_value(call.get("arguments") or row.get("arguments") or {}),
+        }
+    if "tool_result" in payload:
+        payload["tool_result"] = _compact_tool_result(payload["tool_result"])
+    if "observation" in payload:
+        payload["observation"] = _summary_text(payload["observation"], 1200)
+    if "metrics" in payload:
+        payload["metrics"] = _scalar_values(payload["metrics"])
+    if "artifacts" in payload:
+        payload["artifacts"] = _compact_artifacts(payload["artifacts"])
+    if "error" in payload:
+        payload["error"] = _bounded_value(payload["error"], 1500)
     return {key: value for key, value in payload.items() if value is not None}
+
+
+def _compact_tool_result(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        key: item
+        for key, item in {
+            "ok": value.get("ok"),
+            "observation": _summary_text(value.get("observation"), 1200),
+            "metrics": _scalar_values(value.get("metrics")),
+            "artifacts": _compact_artifacts(value.get("artifacts")),
+            "error": _bounded_value(value.get("error"), 1500),
+            "state_patch": _bounded_value(value.get("state_patch"), 2000),
+        }.items()
+        if item not in (None, "", [], {})
+    }
+
+
+def _compact_artifacts(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    rows = []
+    for item in value:
+        if isinstance(item, str):
+            rows.append({"path": item})
+        elif isinstance(item, dict):
+            rows.append(
+                {
+                    key: item[key]
+                    for key in ("path", "kind", "role", "source", "stage", "label")
+                    if item.get(key) not in (None, "")
+                }
+            )
+    return rows
+
+
+def _scalar_values(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        str(key): item
+        for key, item in value.items()
+        if item is None or isinstance(item, (str, int, float, bool))
+    }
+
+
+def _bounded_value(value: Any, limit: int = 4000) -> Any:
+    if value in (None, "", [], {}):
+        return None
+    payload = _jsonable(value)
+    text = json.dumps(payload, ensure_ascii=False)
+    if len(text) <= limit:
+        return payload
+    if isinstance(payload, dict):
+        return {"stored_in_raw_record": True, "keys": sorted(str(key) for key in payload)}
+    if isinstance(payload, list):
+        return {"stored_in_raw_record": True, "items": len(payload)}
+    return _summary_text(payload, limit)
+
+
+def _summary_text(value: Any, limit: int) -> str:
+    text = " ".join(str(value or "").split())
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
 def _event_key(event: dict[str, Any]) -> str:

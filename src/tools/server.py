@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,8 +14,8 @@ if __package__ in {None, ""}:
 from agent.tools import ToolContext, ToolRegistry, ToolResult
 from tools.bash import PowerShellTool
 from tools.deeplens import DEEPLENS_TOOLS
+from tools.deeplens.artifacts import find_lens_artifacts
 from tools.deeplens.contract import finish_result
-from tools.deeplens.fake import FakeDeepLensToolServer
 from tools.edit_file import EditFileTool
 from tools.read_file import ReadFileTool
 from tools.write_file import WriteFileTool
@@ -47,7 +48,7 @@ class RealDeepLensToolServer:
 
     def dispatch(self, tool: str, arguments: JsonObject, state: JsonObject, context: JsonObject | None = None) -> ToolResult:
         if tool == "finish":
-            return finish_result(state)
+            return finish_result(state, arguments.get("verdict"))
         result = self.registry.call(
             tool,
             ctx=ToolContext(project_root=self.project_root, agent_context=context or {}),
@@ -58,15 +59,10 @@ class RealDeepLensToolServer:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="LensBot canonical JSONL tool server.")
-    parser.add_argument("--fake", action="store_true", help="Use deterministic fake DeepLens tools.")
-    parser.add_argument("--real", action="store_true", help="Use real DeepLens tools from src/tools.")
     parser.add_argument("--project-root", default=str(Path.cwd()))
     args = parser.parse_args()
 
-    if args.fake == args.real:
-        raise SystemExit("Choose exactly one tool mode: --fake or --real.")
-
-    server = FakeDeepLensToolServer(args.project_root) if args.fake else RealDeepLensToolServer(args.project_root)
+    server = RealDeepLensToolServer(args.project_root)
     for line in sys.stdin:
         if not line.strip():
             continue
@@ -102,14 +98,26 @@ def parse_request(line: str) -> ToolRequest | None:
 
 def response_line(request_id: str, result: ToolResult) -> str:
     return json.dumps(
-        {
+        _json_safe({
             "type": "tool_response",
             "request_id": request_id,
             "result": result.for_trace(),
-        },
+        }),
         ensure_ascii=False,
+        allow_nan=False,
         default=str,
     )
+
+
+def _json_safe(value: Any) -> Any:
+    """Convert non-finite floats to JSON null at the JSONL process boundary."""
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
 
 
 def _with_pi_contract(tool: str, result: ToolResult) -> ToolResult:
@@ -120,16 +128,14 @@ def _with_pi_contract(tool: str, result: ToolResult) -> ToolResult:
     if tool == "deeplens_curriculum":
         curriculum_json = data.get("curriculum_json")
         if not curriculum_json and data.get("result_dir"):
-            curriculum_json = str(
-                Path(str(data["result_dir"]))
-                / "engines"
-                / "deeplens"
-                / "attempts"
-                / "attempt-001-curriculum"
-                / "curriculum.json"
-            )
+            try:
+                curriculum_json = find_lens_artifacts(Path("."), result_dir=data["result_dir"]).curriculum_json
+            except ValueError:
+                curriculum_json = None
         result.state_patch = {
             "phase": "running",
+            "active_seed_id": data.get("seed_candidate_id"),
+            "params_override": data.get("params"),
             "active_session_id": data.get("session_id"),
             "active_result_dir": data.get("result_dir"),
             "artifacts": {"curriculum_json": curriculum_json},
@@ -138,26 +144,52 @@ def _with_pi_contract(tool: str, result: ToolResult) -> ToolResult:
             "has_curriculum_json": bool(curriculum_json and Path(str(curriculum_json)).exists()),
             "curriculum_iter": data.get("curriculum_iter"),
             "curriculum_total": data.get("curriculum_total"),
+            "iterations_requested": data.get("iterations_requested"),
+            "iterations_executed": data.get("iterations_executed"),
+            "source_lens": data.get("source_lens"),
+            "optimizer_reinitialized": data.get("optimizer_reinitialized"),
         }
         return result
 
     if tool == "deeplens_finetune":
         result.state_patch = {
             "phase": "running",
+            "active_session_id": data.get("session_id"),
+            "active_result_dir": data.get("result_dir"),
             "artifacts": {
-                "final_json": data.get("final_json"),
-                "final_zmx": data.get("final_zmx"),
+                "candidate_json": data.get("candidate_json"),
+                "candidate_zmx": data.get("candidate_zmx"),
+                "candidate_png": data.get("candidate_png"),
             },
         }
         result.metrics = {
             "fine_tune_iter": data.get("fine_tune_iter"),
             "fine_tune_total": data.get("fine_tune_total"),
+            "iterations_requested": data.get("iterations_requested"),
+            "iterations_executed": data.get("iterations_executed"),
+            "source_lens": data.get("source_lens"),
+            "candidate_id": data.get("candidate_id"),
+            "optimizer_reinitialized": data.get("optimizer_reinitialized"),
+            "strategy_lr_scale": data.get("lr_scale"),
         }
         return result
 
+    artifact_patch = {"analysis_json": data.get("analysis_json")}
+    if data.get("has_candidate_json") is True:
+        artifact_patch["candidate_json"] = data.get("candidate_json")
+        if data.get("candidate_zmx"):
+            artifact_patch["candidate_zmx"] = data.get("candidate_zmx")
+        if data.get("candidate_png"):
+            artifact_patch["candidate_png"] = data.get("candidate_png")
+    if data.get("has_final_json") is True:
+        artifact_patch["final_json"] = data.get("final_json")
+        if data.get("final_zmx"):
+            artifact_patch["final_zmx"] = data.get("final_zmx")
+    if data.get("curriculum_json"):
+        artifact_patch["curriculum_json"] = data.get("curriculum_json")
     result.state_patch = {
         "phase": "running",
-        "artifacts": {"analysis_json": data.get("analysis_json")},
+        "artifacts": artifact_patch,
     }
     result.metrics = data
     return result

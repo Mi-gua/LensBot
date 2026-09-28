@@ -29,11 +29,14 @@
     zemaxPending: "Zemax \u5206\u6790\u672a\u5b8c\u6210\uff1a",
     currentSnapshot: "\u5f53\u524d\u955c\u5934\u4f18\u5316\u5feb\u7167",
     snapshotPending: "\u8fd0\u884c\u540e\u6d41\u5f0f\u663e\u793a\u5f53\u524d\u4f18\u5316\u5feb\u7167\u3002",
-    defaultPrompt: "\u8bf7\u4e3a\u5168\u753b\u5e45\u76f8\u673a\u8bbe\u8ba1\u4e00\u4e2a\u6807\u51c6\u955c\u5934\uff1a\u7126\u8ddd 52 mm\uff0cF/2.9\uff0c\u5168\u89c6\u573a 43 \u5ea6\uff0c\u540e\u7126\u8ddd 18 mm\uff0c\u603b\u539a\u5ea6\u63a7\u5236\u5728 120 mm \u5de6\u53f3\u3002\u4f18\u5148\u4fdd\u6301 EFL\u3001FOV \u548c F \u6570\u63a5\u8fd1\u76ee\u6807\uff0c\u5176\u6b21\u4f18\u5316\u4e2d\u5fc3\u548c\u8fb9\u7f18 RMS spot\u3001\u7578\u53d8\u548c MTF\u3002",
+    defaultPrompt: "设计一个全画幅标准摄影镜头： 焦距 50 mm，F/3.0，全视场 43 度，后焦距 18 mm，总厚度约 75 mm。 优先保持 EFL、FOV 和 F 数等规格接近目标；其次优化中心、0.5 视场和边缘 RMS spot 。",
+    reportEmpty: "运行完成后，这里会显示光学镜头设计总结报告。",
   };
   const providers = defaults.llm?.providers || [];
   const providerMap = Object.fromEntries(providers.map((provider) => [provider.id, provider]));
 
+  let confirmedApiConfig;
+  let confirmedEngineConfig;
   let currentMode = "";
   let currentSource = null;
   let streamCompleted = false;
@@ -67,6 +70,9 @@
   const lensStageGallery = document.getElementById("lens-stage-gallery");
   const references = document.getElementById("references");
   const fileMeta = document.getElementById("file-meta");
+  const reportStage = document.getElementById("report-stage");
+  const reportOpen = document.getElementById("report-open");
+  const reportDownload = document.getElementById("report-download");
   const modelPill = document.getElementById("model-pill");
   const viewButtons = [...document.querySelectorAll("[data-view]")];
   const pageViews = [...document.querySelectorAll(".page-view")];
@@ -137,9 +143,18 @@
     return String(value || "").trim().replace(/\/+$/, "").toLowerCase();
   }
 
+  function urlHost(value) {
+    try {
+      return new URL(String(value || "").trim()).hostname.toLowerCase();
+    } catch (_error) {
+      return "";
+    }
+  }
+
   function providerUrlMatches(providerId, baseUrl) {
     const providerUrl = normalizeUrl(providerMap[providerId]?.base_url);
-    return Boolean(providerUrl && baseUrl && providerUrl === baseUrl);
+    if (!providerUrl || !baseUrl) return false;
+    return providerUrl === baseUrl || urlHost(providerUrl) === urlHost(baseUrl);
   }
 
   function syncProviderTabs(preferredProvider = "") {
@@ -149,15 +164,16 @@
       active = preferredProvider;
     } else {
       for (const button of providerButtons) {
-        const providerUrl = normalizeUrl(button.dataset.url);
-        if (providerUrl && baseUrl === providerUrl) {
+        if (providerUrlMatches(button.dataset.provider, baseUrl)) {
           active = button.dataset.provider;
           break;
         }
       }
     }
     providerButtons.forEach((button) => {
-      button.classList.toggle("active", button.dataset.provider === active);
+      const selected = button.dataset.provider === active;
+      button.classList.toggle("active", selected);
+      button.setAttribute("aria-selected", String(selected));
     });
     const modelInput = document.getElementById("llm_model");
     if (modelInput) {
@@ -176,7 +192,7 @@
     if (button.dataset.provider !== "custom" && button.dataset.url) {
       setInputValue("llm_base_url", button.dataset.url);
       const active = syncProviderTabs(provider);
-      setInputValue("llm_model", active === initialProvider ? initialModel : "");
+      setInputValue("llm_model", active === initialProvider ? initialModel : (providerMap[active]?.default_model || ""));
     } else {
       setInputValue("llm_base_url", customBaseUrl);
       setInputValue("llm_model", customModel);
@@ -199,6 +215,7 @@
     };
     statusState.textContent = labels[key] || label || zh.idle;
     statusCopy.textContent = detail || "";
+    statusCopy.title = detail || "";
     statusState.classList.remove("is-idle", "is-running", "is-error");
     if (key.includes("run")) {
       statusState.classList.add("is-running");
@@ -278,7 +295,10 @@
   function handleArtifactPayload(payload) {
     const resultDir = resultDirFromPayload(payload);
     if (resultDir) startPreviewPolling(resultDir);
-    if (payload?.preview) renderArtifacts(payload, { renderFinalDesign: false });
+    if (payload?.preview) {
+      renderArtifacts(payload, { renderFinalDesign: false });
+      renderMetricCards(payload.metrics || {});
+    }
   }
 
   function shouldHandleEvent(event) {
@@ -363,11 +383,12 @@
         title: "DeepLens",
         items: [
           [["deeplens_efl_mm"], "\u6709\u6548\u7126\u8ddd", " mm", 2],
-          [["deeplens_fnum", "fnum"], "F \u6570", "", 2],
+          [["deeplens_fnum"], "\u5de5\u4f5c F \u6570", "", 2],
           [["deeplens_fov_deg"], "\u89c6\u573a", " deg", 2],
-          [["deeplens_distortion_pct_abs_max", "distortion_pct_abs_max"], "\u7578\u53d8", " %", 2],
-          [["deeplens_mtf50_edge_tan_cy_mm", "mtf50_edge_tan_cy_mm"], "\u8fb9\u7f18 MTF50", " cy/mm", 2],
-          [["deeplens_rms_spot_um_edge", "spot_rms_um_edge"], "\u8fb9\u7f18 RMS \u5149\u6591", " um", 2],
+          [["deeplens_distortion_pct_edge"], "\u8fb9\u7f18\u7578\u53d8", " %", 2],
+          [["deeplens_spot_valid_pct_edge"], "\u8fb9\u7f18\u6709\u6548\u5149\u7ebf", " %", 1],
+          [["deeplens_mtf50_edge_tan_cy_mm"], "\u8fb9\u7f18\u51e0\u4f55 MTF50", " cy/mm", 2],
+          [["deeplens_rms_spot_um_edge"], "\u8fb9\u7f18 RMS \u5149\u6591", " um", 2],
           [["deeplens_rms_spot_um_max"], "\u6700\u5927 RMS \u5149\u6591", " um", 2],
         ],
       },
@@ -375,10 +396,11 @@
         title: "Zemax",
         items: [
           [["zemax_efl_mm"], "\u6709\u6548\u7126\u8ddd", " mm", 2],
-          [["zemax_fnum"], "F \u6570", "", 2],
+          [["zemax_fnum"], "\u8fd1\u8f74\u5de5\u4f5c F \u6570", "", 2],
           [["zemax_fov_deg"], "\u89c6\u573a", " deg", 2],
-          [["zemax_distortion_pct_abs_max"], "\u7578\u53d8", " %", 2],
-          [["zemax_mtf50_edge_tan_cy_mm"], "\u8fb9\u7f18 MTF50", " cy/mm", 2],
+          [["zemax_distortion_pct_edge"], "\u8fb9\u7f18\u7578\u53d8", " %", 2],
+          [["zemax_geometric_mtf50_edge_tan_cy_mm"], "\u8fb9\u7f18\u51e0\u4f55 MTF50", " cy/mm", 2],
+          [["zemax_mtf50_edge_tan_cy_mm"], "\u8fb9\u7f18\u884d\u5c04 FFT MTF50", " cy/mm", 2],
           [["zemax_spot_rms_edge_um"], "\u8fb9\u7f18 RMS \u5149\u6591", " um", 2],
           [["zemax_spot_rms_max_um"], "\u6700\u5927 RMS \u5149\u6591", " um", 2],
         ],
@@ -404,11 +426,12 @@
     metrics.innerHTML = html || renderEmptyState(zh.metricsEmpty);
   }
 
-  function renderFileMeta(result, preview) {
+  function renderFileMeta(result) {
+    const preview = result.preview || {};
     const rows = [
-      ["\u4e2d\u95f4\u4f18\u5316\u6570\u636e", result.curriculum_json, result.curriculum_json_url],
       ["\u6700\u7ec8\u6570\u636e", result.final_json, result.final_json_url],
       ["Zemax \u955c\u5934\u6587\u4ef6", result.final_zmx, result.final_zmx_url],
+      ["\u7ed3\u679c\u8bc1\u636e", preview.evidence_path, preview.evidence_url],
       ["\u6458\u8981\u62a5\u544a", result.summary_report_file, result.summary_report_file_url],
       ["\u6307\u6807\u6587\u4ef6", result.metrics_file, result.metrics_file_url],
       ["\u8fd0\u884c\u65e5\u5fd7", result.log_file, result.log_file_url],
@@ -421,6 +444,22 @@
           <p class="file-path">${url ? `<a class="file-link mono" href="${escapeHtml(url)}" target="_blank" rel="noreferrer">${escapeHtml(path)}</a>` : escapeHtml(path)}</p>
         </div>
       `).join("") || renderEmptyState(zh.filesEmpty);
+  }
+
+  function renderReport(result) {
+    const report = (result?.preview?.artifacts || []).find((item) => item.role === "html_review_report");
+    const url = report?.url || "";
+    if (!reportStage || !reportOpen || !reportDownload) return;
+    for (const link of [reportOpen, reportDownload]) {
+      link.classList.toggle("disabled", !url);
+      link.setAttribute("aria-disabled", String(!url));
+      link.href = url || "#";
+    }
+    reportStage.innerHTML = url
+      ? `<iframe class="report-frame" src="${escapeHtml(url)}" title="光学镜头设计总结报告"></iframe>`
+      : result?.ok === false
+        ? renderEmptyState(result.summary || zh.runFailed, { title: "运行未完成，未生成设计报告", tone: "error" })
+        : renderEmptyState(zh.reportEmpty);
   }
 
   function renderImagePanel({ title, subtitle, url, kind, showHead = true }) {
@@ -480,11 +519,13 @@
     return seconds.toFixed(seconds < 10 ? 1 : 0).replace(/\.0$/, "") + " s";
   }
 
-  function traceStatusLabel(status) {
+  function traceStatusLabel(status, context = "") {
     const text = String(status || "").trim().toLowerCase();
+    if (text === "ok" && context === "tool-call") return "完成";
+    if (text === "ok" && context === "tool-result") return "通过";
     const labels = {
       running: "运行中",
-      ok: "正常",
+      ok: "通过",
       error: "异常",
       trace: "记录",
       done: "完成",
@@ -627,9 +668,10 @@
   function transcriptEventsFromStage(stage) {
     const data = stage?.data || {};
     const nativeEvents = Array.isArray(data.transcript_events) ? data.transcript_events : [];
-    if (nativeEvents.length) return nativeEvents;
+    if (nativeEvents.length) return nativeEvents.filter((event) => String(event?.kind || "") !== "agent_end");
     const agentEvents = Array.isArray(data.agent_events) ? data.agent_events : data.react_events;
-    return legacyEventsToTranscript(Array.isArray(agentEvents) ? agentEvents : []);
+    return legacyEventsToTranscript(Array.isArray(agentEvents) ? agentEvents : [])
+      .filter((event) => String(event?.kind || "") !== "agent_end");
   }
 
   function renderTurnDots(events, turnCount = 0) {
@@ -689,7 +731,9 @@
     if (kind === "assistant_message") {
       const text = String(event.text || event.delta || "").trim();
       if (!text) return "";
-      return "<article class=\"transcript-entry transcript-entry--assistant\"" + turnAnchorAttrs(turn, anchorTurns) + ">"
+      const messageId = String(event.message_id || "").trim();
+      const messageAttr = messageId ? " data-message-id=\"" + escapeHtml(messageId) + "\"" : "";
+      return "<article class=\"transcript-entry transcript-entry--assistant\"" + turnAnchorAttrs(turn, anchorTurns) + messageAttr + ">"
         + "<div class=\"transcript-avatar\">A</div>"
         + "<div class=\"transcript-bubble\"><div class=\"transcript-meta\">第 " + escapeHtml(turnDisplay(turn)) + " 轮 · 智能体</div>"
         + "<p>" + escapeHtml(text) + "</p></div>"
@@ -704,7 +748,7 @@
       return "<article class=\"transcript-entry transcript-entry--tool transcript-entry--tool-call\"" + turnAnchorAttrs(turn, anchorTurns) + ">"
         + "<div class=\"transcript-avatar\">T</div>"
         + "<div class=\"transcript-bubble\"><div class=\"transcript-meta\">第 " + escapeHtml(turnDisplay(turn)) + " 轮 · 工具调用</div>"
-        + "<div class=\"tool-call-line\"><strong>" + escapeHtml(toolCall.name || event.tool || "tool") + "</strong><span>" + escapeHtml(traceStatusLabel(status)) + "</span></div>"
+        + "<div class=\"tool-call-line\"><strong>" + escapeHtml(toolCall.name || event.tool || "tool") + "</strong><span>" + escapeHtml(traceStatusLabel(status, "tool-call")) + "</span></div>"
         + renderToolProgress(toolCall.name || event.tool || "tool", status, liveProgress)
         + renderDetails("参数", toolCall.arguments || event.arguments, traceDetailKey("tool-call", turn, eventKey, "arguments"))
         + renderDetails("中间结果", event.partial_result, traceDetailKey("tool-call", turn, eventKey, "partial-result"))
@@ -721,19 +765,11 @@
         + "<div class=\"transcript-bubble\"><div class=\"transcript-meta\">第 " + escapeHtml(turnDisplay(turn)) + " 轮 · 工具结果"
         + (event.duration_ms !== undefined ? " · " + escapeHtml(formatTraceDuration(event.duration_ms)) : "")
         + "</div>"
-        + "<div class=\"tool-call-line\"><strong>" + escapeHtml(event.tool || toolResult.tool || "result") + "</strong><span>" + escapeHtml(traceStatusLabel(status)) + "</span></div>"
+        + "<div class=\"tool-call-line\"><strong>" + escapeHtml(event.tool || toolResult.tool || "result") + "</strong><span>" + escapeHtml(traceStatusLabel(status, "tool-result")) + "</span></div>"
         + "<p>" + escapeHtml(event.observation || toolResult.observation || "-") + "</p>"
         + renderTraceChips(event, toolResult)
         + renderDetails("结果数据", details, traceDetailKey("tool-result", turn, eventKey, "result-data"))
         + "</div></article>";
-    }
-    if (kind === "agent_end" || event.done) {
-      const text = event.text || event.observation || "Optimization agent finished.";
-      return "<article class=\"transcript-entry transcript-entry--assistant transcript-entry--done\"" + turnAnchorAttrs(turn, anchorTurns) + ">"
-        + "<div class=\"transcript-avatar\">A</div>"
-        + "<div class=\"transcript-bubble\"><div class=\"transcript-meta\">已完成</div>"
-        + "<p>" + escapeHtml(text) + "</p></div>"
-        + "</article>";
     }
     return "";
   }
@@ -756,12 +792,12 @@
             <div class="case-candidate-card">
               <div class="case-candidate-head">
                 <strong>${escapeHtml(row.case_id || row.candidate_id || `案例 ${index + 1}`)}</strong>
-                <span>${escapeHtml(row.selected ? "已选中" : (row.applied ? "已应用" : "已检索"))}</span>
+                <span>${escapeHtml(row.applied ? "已应用" : (row.selected ? "已选中" : "已检索"))}</span>
               </div>
               <p>${escapeHtml(row.title || row.category || "参考案例")}</p>
               ${detail ? `<p>${escapeHtml(detail)}</p>` : ""}
               <div class="case-candidate-meta">
-                <span>${escapeHtml(row.applied ? "生成初始结构" : "作为参考保留")}</span>
+                <span>${escapeHtml(row.applied ? "生成初始结构" : (row.selected ? "正在初始化与优化" : "作为参考保留"))}</span>
               </div>
             </div>
           `;
@@ -814,11 +850,45 @@
     restoreTranscriptViewState(transcriptState);
   }
 
+  function ensureTranscriptStream() {
+    if (!optimizationStages) return null;
+    const existing = optimizationStages.querySelector(".transcript-stream");
+    if (existing) return existing;
+    optimizationStages.innerHTML = "<div class=\"strategy-card transcript-card\" data-live-transcript=\"true\"><div class=\"transcript-stream\"></div></div>";
+    return optimizationStages.querySelector(".transcript-stream");
+  }
+
+  function findAssistantMessageArticle(messageId) {
+    if (!optimizationStages || !messageId) return null;
+    return Array.from(optimizationStages.querySelectorAll(".transcript-entry--assistant[data-message-id]"))
+      .find((entry) => entry.dataset.messageId === messageId) || null;
+  }
+
+  function handleTranscriptPayload(payload) {
+    const event = payload?.transcript || payload;
+    if (!event || event.kind !== "assistant_message") return;
+    const text = String(event.text || event.delta || "");
+    if (!text.trim()) return;
+    const messageId = String(event.message_id || "").trim();
+    const stream = ensureTranscriptStream();
+    if (!stream) return;
+    const wasAtBottom = optimizationStages.scrollTop + optimizationStages.clientHeight >= optimizationStages.scrollHeight - 32;
+    let article = findAssistantMessageArticle(messageId);
+    if (!article) {
+      stream.insertAdjacentHTML("beforeend", renderTranscriptEvent(event, new Set(), new Map(), null));
+      article = findAssistantMessageArticle(messageId) || stream.lastElementChild;
+    }
+    const paragraph = article?.querySelector("p");
+    if (paragraph) paragraph.textContent = text.trim();
+    if (wasAtBottom) optimizationStages.scrollTop = optimizationStages.scrollHeight;
+  }
+
   function captureTranscriptViewState() {
     if (!optimizationStages) {
-      return { openDetailKeys: [], detailScrollTops: {}, scrollTop: 0, windowX: 0, windowY: 0 };
+      return { openDetailKeys: [], detailScrollTops: {}, scrollTop: 0, turnJumpScrollLeft: 0, windowX: 0, windowY: 0 };
     }
     const detailScrollTops = {};
+    const turnJumpStrip = optimizationProgressPanel?.querySelector(".turn-jump-strip");
     optimizationStages.querySelectorAll(".trace-details[data-detail-key]").forEach((details) => {
       const pre = details.querySelector("pre");
       if (pre && pre.scrollTop > 0) {
@@ -831,6 +901,7 @@
         .filter(Boolean),
       detailScrollTops,
       scrollTop: optimizationStages.scrollTop,
+      turnJumpScrollLeft: turnJumpStrip?.scrollLeft || 0,
       windowX: window.scrollX,
       windowY: window.scrollY,
     };
@@ -848,6 +919,11 @@
       });
     }
     optimizationStages.scrollTop = Number(state.scrollTop) || 0;
+    const turnJumpStrip = optimizationProgressPanel?.querySelector(".turn-jump-strip");
+    const turnJumpScrollLeft = Number(state.turnJumpScrollLeft);
+    if (turnJumpStrip && Number.isFinite(turnJumpScrollLeft)) {
+      turnJumpStrip.scrollLeft = turnJumpScrollLeft;
+    }
     if (Number.isFinite(state.windowX) && Number.isFinite(state.windowY)) {
       window.scrollTo(state.windowX, state.windowY);
     }
@@ -896,30 +972,37 @@
   function renderCompletionNarrative(result, preview) {
     const stageLabel = preview.final_image_url
       ? "最终优化结果"
-      : (preview.curriculum_image_url ? "当前优化快照" : "初始结构");
+      : (preview.candidate_image_url ? "当前最佳候选" : (preview.curriculum_image_url ? "课程学习候选" : "初始结构"));
     const summary = String(result.summary || "").replace(/\s+/g, " ").trim();
+    const fallback = preview.final_image_url
+      ? "优化已完成，最终总结将在结果产物写入后显示。"
+      : "候选结果已导出，智能体仍可继续分析、微调或调整策略。";
     return `
       <div class="completion-narrative">
         <span>${escapeHtml(stageLabel)}</span>
-        <p>${escapeHtml(summary || "优化已完成，最终总结将在结果产物写入后显示。")}</p>
+        <p>${escapeHtml(summary || fallback)}</p>
       </div>
     `;
   }
 
-  function renderCompletionSummary(result, preview, params) {
-    if (!preview?.final_image_url && !preview?.curriculum_image_url && !preview?.starting_image_url) {
+  function renderCompletionSummary(result, preview) {
+    if (!preview?.final_image_url && !preview?.candidate_image_url && !preview?.curriculum_image_url && !preview?.starting_image_url) {
       return renderEmptyState("运行后显示关键结果摘要。");
     }
     const metricMap = result.metrics || {};
-    const snapshotUrl = preview.final_image_url || preview.curriculum_image_url || preview.starting_image_url;
-    const rows = [
-      ["焦距", preview.foclen_display],
-      ["F 数", preview.fnum_display],
-      ["视场", preview.fov_display],
-      ["边缘 RMS", formatValue(firstValue(metricMap, ["deeplens_rms_spot_um_edge", "spot_rms_um_edge"]), " um", 2)],
-      ["边缘 MTF50", formatValue(firstValue(metricMap, ["deeplens_mtf50_edge_tan_cy_mm", "mtf50_edge_tan_cy_mm"]), " cy/mm", 2)],
-      ["畸变", formatValue(firstValue(metricMap, ["deeplens_distortion_pct_abs_max", "distortion_pct_abs_max"]), " %", 2)],
-    ].filter(([, value]) => value && value !== "-");
+    const snapshotUrl = preview.final_image_url || preview.candidate_image_url || preview.curriculum_image_url || preview.starting_image_url;
+    const evidenceItems = (preview.evidence?.sections || []).flatMap((section) => section.items || []);
+    const rows = evidenceItems.length
+      ? evidenceItems.slice(0, 6).map((item) => [
+          item.label || item.key,
+          formatValue(item.primary?.value, item.unit ? ` ${item.unit}` : "", 2),
+        ])
+      : [
+          ["焦距", preview.foclen_display],
+          ["F 数", preview.fnum_display],
+          ["视场", preview.fov_display],
+          ["边缘 RMS", formatValue(firstValue(metricMap, ["deeplens_rms_spot_um_edge", "spot_rms_um_edge"]), " um", 2)],
+        ].filter(([, value]) => value && value !== "-");
     return `
       <div class="completion-summary">
         <div class="completion-thumb">
@@ -942,7 +1025,7 @@
   function renderArtifacts(result, { renderFinalDesign = true } = {}) {
     const preview = result.preview || null;
     const zemaxFigures = preview && preview.zemax_figures ? preview.zemax_figures : [];
-    if (!preview || (!preview.starting_image_url && !preview.curriculum_image_url && !preview.final_image_url && !zemaxFigures.length)) {
+    if (!preview || (!preview.starting_image_url && !preview.curriculum_image_url && !preview.candidate_image_url && !preview.final_image_url && !zemaxFigures.length)) {
       artifacts.innerHTML = renderEmptyState(zh.artifactsEmpty);
       renderOptimizationStages(preview?.optimization_stages || [], preview?.deeplens_progress);
       if (renderFinalDesign) {
@@ -956,18 +1039,10 @@
           lensStageGallery.innerHTML = renderEmptyState("运行后显示关键结果摘要。");
         }
       }
-      renderFileMeta(result, preview);
+      renderFileMeta(result);
       return;
     }
     renderOptimizationStages(preview.optimization_stages || [], preview.deeplens_progress);
-
-    const params = [
-      ["\u7126\u8ddd", preview.foclen_display],
-      ["F \u6570", preview.fnum_display],
-      ["\u89c6\u573a", preview.fov_display],
-      ["\u4f20\u611f\u5668\u534a\u5f84", preview.r_sensor_display],
-      ["\u7ed3\u6784\u7ec4\u6570", preview.structure_group_count_display],
-    ];
 
     if (initialStructure) {
       initialStructure.innerHTML = renderImagePanel({
@@ -978,10 +1053,10 @@
       });
     }
     if (currentSnapshot) {
-      const snapshotUrl = preview.final_image_url || preview.curriculum_image_url || preview.starting_image_url;
-      const snapshotLabel = preview.final_image_url
-        ? "\u6700\u7ec8\u7ed3\u6784"
-        : (preview.curriculum_image_url ? "\u4e2d\u95f4\u4f18\u5316\u6001" : "\u521d\u59cb\u7ed3\u6784");
+      const snapshotUrl = preview.current_image_url || preview.curriculum_image_url || preview.starting_image_url;
+      const snapshotLabel = preview.current_image_url
+        ? "\u5f53\u524d\u4f18\u5316\u5feb\u7167"
+        : (preview.curriculum_image_url ? "\u8bfe\u7a0b\u5b66\u4e60\u5019\u9009" : "\u521d\u59cb\u7ed3\u6784");
       currentSnapshot.innerHTML = renderImagePanel({
         title: zh.currentSnapshot,
         subtitle: snapshotLabel,
@@ -991,15 +1066,15 @@
       });
     }
     if (lensStageGallery && renderFinalDesign) {
-      lensStageGallery.innerHTML = renderCompletionSummary(result, preview, params);
+      lensStageGallery.innerHTML = renderCompletionSummary(result, preview);
     }
 
     const zemaxSection = zemaxFigures.length
-      ? `<div class="zemax-strip">${zemaxFigures.map((figure, index) => renderImagePanel({
+      ? `<div class="zemax-strip">${zemaxFigures.map((figure) => renderImagePanel({
           title: figure.title || "Zemax \u56fe\u8868",
           subtitle: figure.subtitle || "\u7531 final.zmx \u751f\u6210",
           url: figure.url,
-          kind: index >= 2 || figure.key === "spot_diagram" ? "zemax zemax-wide" : "zemax",
+          kind: figure.role === "zemax_spot_diagram" ? "zemax zemax-wide" : "zemax",
         })).join("")}</div>`
       : (preview.zemax_error ? renderEmptyState(`${zh.zemaxPending}${preview.zemax_error}`, { title: zh.imagePendingTitle, tone: "image" }) : "");
 
@@ -1008,7 +1083,7 @@
         ${zemaxSection || renderEmptyState(zh.artifactsEmpty)}
       </div>
     `;
-    renderFileMeta(result, preview);
+    renderFileMeta(result);
   }
 
   function renderReferences(rows) {
@@ -1050,6 +1125,7 @@
     renderOptimizationStages([], null);
     references.innerHTML = renderEmptyState(zh.refsEmpty);
     fileMeta.innerHTML = renderEmptyState(zh.filesEmpty);
+    renderReport(null);
     runBtn.disabled = false;
     setStatus("idle", zh.waitTask);
   }
@@ -1058,28 +1134,78 @@
     const params = defaultParams;
     const llm = defaults.llm || {};
     setInputValue("nl_prompt", zh.defaultPrompt);
-    setInputValue("foclen", params.foclen ?? 52);
+    setInputValue("foclen", params.foclen ?? 50);
     setInputValue("fov", params.fov ?? 43);
-    setInputValue("fnum", params.fnum ?? 2.9);
+    setInputValue("fnum", params.fnum ?? 3.0);
     setInputValue("bfl", params.bfl ?? 18);
-    setInputValue("thickness", params.thickness ?? 120);
+    setInputValue("thickness", params.thickness ?? 75);
     setInputValue("llm_base_url", llm.base_url || "");
     setInputValue("llm_model", llm.model || "");
-    setInputValue("llm_temperature", 0.3);
+    setInputValue("llm_temperature", llm.temperature ?? 0.3);
+    setInputValue("optimization_max_turns", defaults.optimization?.max_turns ?? 50);
+    setInputValue("engine_seed", params.seed);
+    setInputValue("engine_lr_scale", params.lr_scale ?? 1.0);
     initialModel = llm.model || "";
     customBaseUrl = llm.provider === "custom" ? (llm.base_url || "") : "";
     customModel = llm.provider === "custom" ? (llm.model || "") : "";
     initialProvider = syncProviderTabs(llm.provider || "");
-    setInputValue("iterations", params.curriculum?.iterations ?? 3000);
+    setInputValue("iterations", params.curriculum?.iterations ?? 2000);
     setInputValue("spp", params.curriculum?.spp ?? "");
     setInputValue("test_per_iter", params.curriculum?.test_per_iter ?? "");
     setInputValue("curriculum_num_ring", params.curriculum?.num_ring ?? "");
     setInputValue("curriculum_num_arm", params.curriculum?.num_arm ?? "");
-    setInputValue("fine_tune_iterations", params.fine_tune?.iterations ?? 2000);
+    setInputValue("fine_tune_iterations", params.fine_tune?.iterations ?? 5000);
     setInputValue("fine_tune_spp", params.fine_tune?.spp ?? "");
     setInputValue("fine_tune_test_per_iter", params.fine_tune?.test_per_iter ?? "");
     setInputValue("fine_tune_num_ring", params.fine_tune?.num_ring ?? "");
     setInputValue("fine_tune_num_arm", params.fine_tune?.num_arm ?? "");
+  }
+
+  function readApiConfig() {
+    return {
+      max_turns: numberValue("optimization_max_turns"),
+      llm: {
+        base_url: textValue("llm_base_url"),
+        api_key: textValue("llm_api_key"),
+        model: textValue("llm_model"),
+        temperature: numberValue("llm_temperature"),
+      },
+    };
+  }
+
+  function readEngineConfig() {
+    return {
+      seed: numberValue("engine_seed"),
+      lr_scale: numberValue("engine_lr_scale"),
+      curriculum: {
+        iterations: numberValue("iterations"),
+        spp: numberValue("spp"),
+        test_per_iter: numberValue("test_per_iter"),
+        num_ring: numberValue("curriculum_num_ring"),
+        num_arm: numberValue("curriculum_num_arm"),
+      },
+      fine_tune: {
+        iterations: numberValue("fine_tune_iterations"),
+        spp: numberValue("fine_tune_spp"),
+        test_per_iter: numberValue("fine_tune_test_per_iter"),
+        num_ring: numberValue("fine_tune_num_ring"),
+        num_arm: numberValue("fine_tune_num_arm"),
+      },
+    };
+  }
+
+  function confirmConfig(kind) {
+    const panel = document.getElementById(`${kind}-config-panel`);
+    for (const input of panel.querySelectorAll("input")) {
+      if (!input.reportValidity()) return;
+    }
+    if (kind === "api") {
+      confirmedApiConfig = readApiConfig();
+      confirmedApiConfig.max_turns_is_limit = confirmedApiConfig.max_turns !== null;
+    } else {
+      confirmedEngineConfig = readEngineConfig();
+    }
+    document.getElementById(`${kind}-config-status`).textContent = "已确认，下次运行生效（当前页面）";
   }
 
   async function startRun() {
@@ -1105,6 +1231,8 @@
     renderOptimizationStages([], null);
     references.innerHTML = renderRunningState();
     fileMeta.innerHTML = renderRunningState();
+    renderReport(null);
+    if (reportStage) reportStage.innerHTML = renderRunningState("正在整理光学镜头设计总结报告...");
 
     const payload = {
       mode: currentMode,
@@ -1114,26 +1242,8 @@
       fnum: Number(document.getElementById("fnum").value),
       bfl: Number(document.getElementById("bfl").value),
       thickness: Number(document.getElementById("thickness").value),
-      llm: {
-        base_url: textValue("llm_base_url"),
-        api_key: textValue("llm_api_key"),
-        model: textValue("llm_model"),
-        temperature: numberValue("llm_temperature"),
-      },
-      curriculum: {
-        iterations: numberValue("iterations"),
-        spp: numberValue("spp"),
-        test_per_iter: numberValue("test_per_iter"),
-        num_ring: numberValue("curriculum_num_ring"),
-        num_arm: numberValue("curriculum_num_arm"),
-      },
-      fine_tune: {
-        iterations: numberValue("fine_tune_iterations"),
-        spp: numberValue("fine_tune_spp"),
-        test_per_iter: numberValue("fine_tune_test_per_iter"),
-        num_ring: numberValue("fine_tune_num_ring"),
-        num_arm: numberValue("fine_tune_num_arm"),
-      },
+      ...confirmedApiConfig,
+      ...confirmedEngineConfig,
     };
 
     setStatus("running", zh.creatingRun);
@@ -1163,6 +1273,10 @@
       if (!shouldHandleEvent(event)) return;
       handleArtifactPayload(JSON.parse(event.data));
     });
+    currentSource.addEventListener("transcript", (event) => {
+      if (!shouldHandleEvent(event)) return;
+      handleTranscriptPayload(JSON.parse(event.data));
+    });
     currentSource.addEventListener("references", (event) => {
       if (!shouldHandleEvent(event)) return;
       const payload = JSON.parse(event.data);
@@ -1177,8 +1291,10 @@
       refreshElapsed();
       renderMetricCards(payload.metrics || {});
       renderArtifacts(payload, { renderFinalDesign: true });
+      renderReport(payload);
       renderReferences(payload.references || []);
-      setStatus(payload.ok ? "done" : "error", payload.ok ? zh.designDone : (payload.summary || zh.doneWithIssues));
+      const summary = payload.summary || zh.runFailed;
+      setStatus(payload.ok ? "done" : "error", payload.ok ? zh.designDone : summary);
     });
     currentSource.addEventListener("run_error", (event) => {
       if (!shouldHandleEvent(event)) return;
@@ -1252,6 +1368,17 @@
   resetBtn.addEventListener("click", resetView);
 
   fillDefaults();
+  confirmedApiConfig = readApiConfig();
+  confirmedEngineConfig = readEngineConfig();
+  for (const kind of ["api", "engine"]) {
+    document.getElementById(`confirm-${kind}-config`).addEventListener("click", () => confirmConfig(kind));
+    const markDraft = () => {
+      document.getElementById(`${kind}-config-status`).textContent = "有未确认修改，下次运行仍使用已确认配置";
+    };
+    const panel = document.getElementById(`${kind}-config-panel`);
+    panel.addEventListener("input", markDraft);
+    panel.querySelectorAll("[data-provider]").forEach((button) => button.addEventListener("click", markDraft));
+  }
   if (modelPill) {
     modelPill.textContent = defaults.llm?.model || zh.modelMissing;
     modelPill.title = defaults.llm?.base_url || "";

@@ -1,0 +1,241 @@
+{
+  "schema_version": 3,
+  "delivery": {
+    "status": "ready",
+    "label": "有效产物已提交",
+    "missing_artifacts": [],
+    "source": "optimization_finish",
+    "meaning": "仅表示优化智能体已提交并通过必需文件检查，不代表任何光学指标达标。"
+  },
+  "verdict": {
+    "status": "uncertain",
+    "label": "暂无法判断",
+    "reason": "Selected candidate-003, best of the seed_198 all-spherical 6-element Double Gauss line: physically feasible (min vertex spacing 2.65 mm, 0 aspheres, all distortion rays valid) and close to contract but not exact - ray-traced EFL 51.26 mm (+2.5%), sensor-implied FOV 45.97 deg (-2.2%), working F/2.833 (+1.2%). Since the contract states these as exact with no tolerance, compliance cannot be certified (all three marked unknown_tolerance). Image quality is only modest (RMS spot 44/55/72 um center/mid/edge, center geometric MTF50 7.4 cy/mm, edge distortion -4.2%), and edge-ray validity fractions are not reported, so edge performance stays unconfirmed. Reported as a weak-but-fully-evidenced outcome, not a validated pass nor a demonstrated constraint violation.",
+    "stop_reason": "Fine-tune decelerated across three equal chunks (loss_rms 0.0655->0.0520->0.0467; edge RMS spot 120->82->72 um; center spot 57->47->44 um) while the ~+2.5% EFL offset and +/-1.2% F/# wander stayed stable, and the exported artifact itself records the realized 51.3 mm EFL - i.e. the residual is set at the objective/parametrization level, not by this starting basin, so another seed or more iterations would not introduce a decision-changing result. Optimization stops with the best evidenced artifact.",
+    "evidence": [
+      "deeplens_efl_mm",
+      "deeplens_fov_deg",
+      "deeplens_fnum",
+      "deeplens_rms_spot_um_center",
+      "deeplens_rms_spot_um_edge",
+      "deeplens_mtf50_center_tan_cy_mm",
+      "deeplens_distortion_pct_edge",
+      "deeplens_min_surface_vertex_spacing_mm"
+    ],
+    "source": "optimization_agent"
+  },
+  "summary": "Agent 判断：暂无法判断。Selected candidate-003, best of the seed_198 all-spherical 6-element Double Gauss line: physically feasible (min vertex spacing 2.65 mm, 0 aspheres, all distortion rays valid) and close to contract but not exact - ray-traced EFL 51.26 mm (+2.5%), sensor-implied FOV 45.97 deg (-2.2%), working F/2.833 (+1.2%). Since the contract states these as exact with no tolerance, compliance cannot be certified (all three marked unknown_tolerance). Image quality is only modest (RMS spot 44/55/72 um center/mid/edge, center geometric MTF50 7.4 cy/mm, edge distortion -4.2%), and edge-ray validity fractions are not reported, so edge performance stays unconfirmed. Reported as a weak-but-fully-evidenced outcome, not a validated pass nor a demonstrated constraint violation.",
+  "sections": [
+    {
+      "key": "specification",
+      "title": "核心规格",
+      "items": [
+        {
+          "key": "efl_mm",
+          "label": "有效焦距",
+          "unit": "mm",
+          "target": 50.0,
+          "primary": {
+            "source": "Zemax",
+            "value": 51.31261475470047,
+            "path": "verification/zemax/zemax_report.json"
+          },
+          "supporting": [
+            {
+              "source": "DeepLens",
+              "value": 51.25730834537093,
+              "path": "metrics.json"
+            }
+          ],
+          "delta": 1.31261475,
+          "delta_pct": 2.6252
+        },
+        {
+          "key": "fnum",
+          "label": "工作 F 数",
+          "unit": "",
+          "target": 2.8,
+          "primary": {
+            "source": "Zemax",
+            "value": 2.806954802873609,
+            "path": "verification/zemax/zemax_report.json"
+          },
+          "supporting": [
+            {
+              "source": "DeepLens",
+              "value": 2.833122468864101,
+              "path": "metrics.json"
+            }
+          ],
+          "delta": 0.0069548,
+          "delta_pct": 0.2484
+        },
+        {
+          "key": "fov_deg",
+          "label": "全视场",
+          "unit": "deg",
+          "target": 47.0,
+          "primary": {
+            "source": "Zemax",
+            "value": 45.511094159623845,
+            "path": "verification/zemax/zemax_report.json"
+          },
+          "supporting": [
+            {
+              "source": "DeepLens",
+              "value": 45.96696590467501,
+              "path": "metrics.json"
+            }
+          ],
+          "delta": -1.48890584,
+          "delta_pct": -3.1679
+        },
+        {
+          "key": "total_track_mm",
+          "label": "总长 TTL（输入初值与最终实测）",
+          "unit": "mm",
+          "target": null,
+          "primary": {
+            "source": "最终结构",
+            "value": 75.24,
+            "path": "final/final.json"
+          },
+          "supporting": [
+            {
+              "source": "输入初值",
+              "value": 75.0,
+              "path": "metrics.json"
+            }
+          ],
+          "delta": null,
+          "delta_pct": null
+        },
+        {
+          "key": "back_focal_length_mm",
+          "label": "后焦距 BFL（输入初值与最终实测）",
+          "unit": "mm",
+          "target": null,
+          "primary": {
+            "source": "最终结构",
+            "value": 16.739,
+            "path": "final/final.json"
+          },
+          "supporting": [
+            {
+              "source": "输入初值",
+              "value": 18.0,
+              "path": "metrics.json"
+            }
+          ],
+          "delta": null,
+          "delta_pct": null
+        }
+      ]
+    },
+    {
+      "key": "image_quality",
+      "title": "成像质量",
+      "items": [
+        {
+          "key": "rms_spot_max_um",
+          "label": "最大 RMS 光斑",
+          "unit": "um",
+          "target": null,
+          "primary": {
+            "source": "Zemax",
+            "value": 71.9216389192228,
+            "path": "verification/zemax/zemax_report.json"
+          },
+          "supporting": [
+            {
+              "source": "DeepLens",
+              "value": 71.6961,
+              "path": "metrics.json"
+            }
+          ],
+          "delta": null,
+          "delta_pct": null
+        },
+        {
+          "key": "fft_mtf50_center_tan_cy_mm",
+          "label": "中心 FFT MTF50",
+          "unit": "cy/mm",
+          "target": null,
+          "primary": {
+            "source": "Zemax",
+            "value": 6.142358122652866,
+            "path": "verification/zemax/zemax_report.json"
+          },
+          "supporting": [],
+          "delta": null,
+          "delta_pct": null
+        },
+        {
+          "key": "fft_mtf50_edge_tan_cy_mm",
+          "label": "边缘 FFT MTF50",
+          "unit": "cy/mm",
+          "target": null,
+          "primary": {
+            "source": "Zemax",
+            "value": 4.252575188358205,
+            "path": "verification/zemax/zemax_report.json"
+          },
+          "supporting": [],
+          "delta": null,
+          "delta_pct": null
+        },
+        {
+          "key": "edge_valid_rays_pct",
+          "label": "边缘有效光线",
+          "unit": "%",
+          "target": null,
+          "primary": {
+            "source": "Zemax",
+            "value": 100.0,
+            "path": "verification/zemax/zemax_report.json"
+          },
+          "supporting": [],
+          "delta": null,
+          "delta_pct": null
+        },
+        {
+          "key": "distortion_abs_max_pct",
+          "label": "最大绝对畸变",
+          "unit": "%",
+          "target": null,
+          "primary": {
+            "source": "Zemax",
+            "value": 2.8784793919970646,
+            "path": "verification/zemax/zemax_report.json"
+          },
+          "supporting": [
+            {
+              "source": "DeepLens",
+              "value": 4.2266156524419785,
+              "path": "metrics.json"
+            }
+          ],
+          "delta": null,
+          "delta_pct": null
+        }
+      ]
+    }
+  ],
+  "sources": [
+    {
+      "key": "final_lens",
+      "label": "最终镜头结构",
+      "path": "final/final.json"
+    },
+    {
+      "key": "zemax_report",
+      "label": "Zemax 独立验证",
+      "path": "verification/zemax/zemax_report.json"
+    },
+    {
+      "key": "optimization_trace",
+      "label": "优化审计记录",
+      "path": "agents/optimization/views/turns.json"
+    }
+  ]
+}

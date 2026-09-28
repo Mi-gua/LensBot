@@ -1,7 +1,6 @@
 ﻿from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
@@ -12,7 +11,8 @@ from agent.tools import ToolContext, ToolRegistry
 from agent.settings import AgentInput, AgentResult
 from agent.tools import LensToolset
 from runtime.artifacts import refresh_run_manifest
-from runtime.result import ResultWorkspace, safe_run_id
+from runtime.evidence import compact_metric_values
+from runtime.result import ResultWorkspace, new_run_id
 from runtime.timeline import TimelineCatalog, TimelineEvent
 from runtime.traces import append_agent_event, append_timeline_event, trace_row as _trace_row
 from subagents.types import LensDesignParams, SeedCandidate, public_params_dict
@@ -21,6 +21,7 @@ from subagents.types import LensDesignParams, SeedCandidate, public_params_dict
 ProgressCallback = Callable[[dict[str, Any]], None]
 ArtifactCallback = Callable[[str], None]
 ReferenceCallback = Callable[[list[dict[str, Any]]], None]
+TranscriptCallback = Callable[[dict[str, Any]], None]
 
 @dataclass
 class WorkflowContext:
@@ -33,17 +34,16 @@ class WorkflowContext:
     metrics: dict[str, Any] = field(default_factory=dict)
     timeline: list[dict[str, Any]] = field(default_factory=list)
     agent_trace: list[dict[str, Any]] = field(default_factory=list)
-    accepted: bool = False
+    delivery_status: str = "running"
     issues: list[str] = field(default_factory=list)
     result: AgentResult | None = None
-    failed: bool = False
     failure_summary: str = ""
     runtime_result_dir: str | None = None
     global_trace_written_count: int = 0
     run_id: str = ""
 
     def fail(self, summary: str) -> None:
-        self.failed = True
+        self.delivery_status = "failed"
         self.failure_summary = summary
 
 
@@ -82,6 +82,7 @@ class LensWorkflow:
         self.progress_cb: ProgressCallback | None = None
         self.artifact_cb: ArtifactCallback | None = None
         self.reference_cb: ReferenceCallback | None = None
+        self.transcript_cb: TranscriptCallback | None = None
 
     def run(
         self,
@@ -90,10 +91,12 @@ class LensWorkflow:
         progress_cb: ProgressCallback | None = None,
         artifact_cb: ArtifactCallback | None = None,
         reference_cb: ReferenceCallback | None = None,
+        transcript_cb: TranscriptCallback | None = None,
     ) -> AgentResult:
         self.progress_cb = progress_cb
         self.artifact_cb = artifact_cb
         self.reference_cb = reference_cb
+        self.transcript_cb = transcript_cb
         ctx = WorkflowContext(
             request=request,
             memory_snapshot=self.memory.create_snapshot(request),
@@ -108,15 +111,29 @@ class LensWorkflow:
             try:
                 node.run(ctx, self)
             except Exception as exc:
-                failure = self.timeline.event("workflow.node.failed", node=node.name, node_label=_node_label(node.name), error=exc)
-                ctx.fail(failure.message)
-                self._publish_timeline_event(ctx, failure)
+                ctx.fail(f"{type(exc).__name__}: {exc}")
+            if ctx.delivery_status == "failed":
+                reason = ctx.failure_summary
+                ctx.failure_summary = f"{_node_label(node.name)}（{node.name}）失败：{ctx.failure_summary}"
+                ctx.metrics["failure_stage"] = node.name
+                self.emit_event(ctx, "workflow.node.failed", node=node.name,
+                                node_label=f"{_node_label(node.name)}（{node.name}）", error=reason)
+                self._archive_workflow_state(ctx, node.name)
+                ctx.result = AgentResult(
+                    ok=False, summary=ctx.failure_summary,
+                    result_dir=ctx.runtime_result_dir,
+                    curriculum_json=ctx.design_result.get("curriculum_json"),
+                    candidate_json=ctx.design_result.get("candidate_json"),
+                    candidate_zmx=ctx.design_result.get("candidate_zmx"),
+                    candidate_png=ctx.design_result.get("candidate_png"),
+                    final_json=ctx.design_result.get("final_json"),
+                    final_zmx=ctx.design_result.get("final_zmx"),
+                    metrics=ctx.metrics, references=ctx.references,
+                    timeline=ctx.timeline, memory_snapshot=ctx.memory_snapshot,
+                )
+                break
             self.emit_event(ctx, "workflow.node.done", node=node.name, node_label=_node_label(node.name))
             self._archive_workflow_state(ctx, node.name)
-            if ctx.failed:
-                ReportingNode().run(ctx, self)
-                self._archive_workflow_state(ctx, "Reporting")
-                break
 
         if ctx.result is None:
             ctx.result = AgentResult(
@@ -185,6 +202,10 @@ class LensWorkflow:
         if self.reference_cb:
             self.reference_cb(references)
 
+    def publish_transcript(self, ctx: WorkflowContext, row: dict[str, Any]) -> None:
+        if self.transcript_cb:
+            self.transcript_cb(row)
+
     def tool_context(
         self,
         ctx: WorkflowContext,
@@ -222,23 +243,29 @@ class LensWorkflow:
         if node == "Seeding":
             candidates = _seed_candidates_payload(ctx)
             self.record_workflow_artifact(ctx, node, "seed_candidates", candidates)
-            self.record_workflow_artifact(ctx, node, "selected_seed", _selected_seed_payload(ctx))
         if node == "Optimization" and ctx.design_result:
+            self.record_workflow_artifact(ctx, "Seeding", "selected_seed", _selected_seed_payload(ctx))
             self.record_workflow_artifact(
                 ctx,
                 node,
                 "optimization_result",
-                {"design_result": ctx.design_result, "metrics": ctx.metrics},
+                {
+                    "schema_version": 3,
+                    "artifacts": _design_artifact_refs(ctx.design_result),
+                    "key_metrics": compact_metric_values(ctx.metrics),
+                    "agent_verdict": ctx.metrics.get("agent_verdict"),
+                    "optimization_trace": "../../agents/optimization/views/turns.json",
+                },
             )
         if node == "Analysis":
             self.record_workflow_artifact(
                 ctx,
                 node,
-                "acceptance",
-                {"accepted": ctx.accepted, "issues": ctx.issues, "metrics": ctx.metrics.get("acceptance")},
+                "delivery",
+                {"status": ctx.delivery_status, "issues": ctx.issues, "details": ctx.metrics.get("delivery")},
             )
         if node in {"Reporting", "Result"} and ctx.result is not None:
-            self.record_workflow_artifact(ctx, "Reporting", "agent_result", ctx.result)
+            self.record_workflow_artifact(ctx, node, "agent_result", _result_index(ctx.result))
 
     def _normalize_result_dir(self, value: str | None) -> str | None:
         if not value:
@@ -288,12 +315,14 @@ class LensResearchAgent:
         progress_cb: ProgressCallback | None = None,
         artifact_cb: Callable[[str], None] | None = None,
         reference_cb: ReferenceCallback | None = None,
+        transcript_cb: TranscriptCallback | None = None,
     ) -> AgentResult:
         return self.workflow.run(
             request,
             progress_cb=progress_cb,
             artifact_cb=artifact_cb,
             reference_cb=reference_cb,
+            transcript_cb=transcript_cb,
         )
 
 
@@ -333,6 +362,7 @@ class IntakeNode:
                         observation=result.message,
                         data=result.for_trace(),
                         done=True,
+                        ok=False,
                     )
                 )
             else:
@@ -351,7 +381,7 @@ class IntakeNode:
                 )
 
         if ctx.params is not None:
-            message = "Budget: curriculum={curriculum}, fine_tune={fine_tune}".format(
+            message = "Suggested starting effort: curriculum={curriculum}, fine_tune={fine_tune}; the optimization agent may adapt it from evidence.".format(
                 curriculum=ctx.params.curriculum.iterations,
                 fine_tune=ctx.params.fine_tune.iterations,
             )
@@ -359,8 +389,8 @@ class IntakeNode:
                 _trace_row(
                     agent=self.name,
                     turn=len(trace),
-                    thought="Confirm the optimization budget before moving downstream.",
-                    action="confirm_budget",
+                    thought="Record starting effort guidance before moving downstream.",
+                    action="record_effort_guidance",
                     action_input={},
                     observation=message,
                     done=True,
@@ -420,10 +450,7 @@ def _node_label(name: str) -> str:
 
 
 def _run_id_for_request(request: AgentInput) -> str:
-    params = request.params
-    name = getattr(params, "exp_name", None) or "lensbot-run"
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-    return safe_run_id(f"{name}-{stamp}")
+    return new_run_id()
 
 
 def _request_payload(request: AgentInput) -> dict[str, Any]:
@@ -431,39 +458,46 @@ def _request_payload(request: AgentInput) -> dict[str, Any]:
         "mode": request.mode,
         "prompt": request.prompt,
         "params": public_params_dict(request.params),
+        "max_turns": request.max_turns,
+        "recommended_max_turns": request.recommended_max_turns,
     }
 
 
 def _workflow_state_payload(ctx: WorkflowContext, node: str) -> dict[str, Any]:
-    return _jsonable(
-        {
-            "run_id": ctx.run_id,
-            "node": node,
-            "params": public_params_dict(ctx.params),
-            "references": ctx.references,
-            "seed_candidates": [
-                {
-                    "candidate_id": item.candidate_id,
-                    "case_id": item.case_id,
-                    "title": item.title,
-                    "category": item.category,
-                    "path": item.path,
-                    "applied": item.applied,
-                    "inspected": item.inspected,
-                    "params": public_params_dict(item.params),
-                }
-                for item in ctx.seed_candidates
-            ],
-            "design_result": ctx.design_result,
-            "metrics": ctx.metrics,
-            "accepted": ctx.accepted,
-            "issues": ctx.issues,
-            "failed": ctx.failed,
-            "failure_summary": ctx.failure_summary,
-            "result": ctx.result,
-            "timeline": ctx.timeline,
-        }
-    )
+    return {
+        "schema_version": 3,
+        "run_id": ctx.run_id,
+        "node": node,
+        "status": ctx.delivery_status,
+        "failure_summary": ctx.failure_summary or None,
+        "issues": list(ctx.issues),
+        "artifacts": _design_artifact_refs(ctx.design_result),
+        "refs": _workflow_refs(node),
+    }
+
+
+def _workflow_refs(node: str) -> dict[str, str]:
+    order = {"Intake": 0, "Seeding": 1, "Optimization": 2, "Analysis": 3, "Reporting": 4, "Result": 5}
+    index = order.get(node, 0)
+    refs = {"params": "../intake/params.json", "timeline": "../timeline.json"}
+    if index >= 1:
+        refs.update(
+            {
+                "seed_candidates": "../seeding/seed_candidates.json",
+                "selected_seed": "../seeding/selected_seed.json",
+            }
+        )
+    if index >= 2:
+        refs["optimization_trace"] = "../../agents/optimization/views/turns.json"
+    if index >= 4:
+        refs.update(
+            {
+                "evidence": "../../evidence.json",
+                "metrics": "../../metrics.json",
+                "agent_result": "../result/agent_result.json" if node == "Result" else "../reporting/agent_result.json",
+            }
+        )
+    return refs
 
 
 def _seed_candidates_payload(ctx: WorkflowContext) -> list[dict[str, Any]]:
@@ -472,9 +506,61 @@ def _seed_candidates_payload(ctx: WorkflowContext) -> list[dict[str, Any]]:
 
 def _selected_seed_payload(ctx: WorkflowContext) -> dict[str, Any] | None:
     for item in ctx.seed_candidates:
-        if item.applied or item.inspected:
-            return _seed_candidate_artifact(item)
+        if item.applied:
+            return {
+                "candidate_id": item.candidate_id,
+                "case_id": item.case_id,
+                "title": item.title,
+                "path": item.path,
+                "applied": item.applied,
+                "inspected": item.inspected,
+                "reasons": list(item.reasons),
+                "source": "seed_candidates.json",
+            }
     return None
+
+
+def _design_artifact_refs(design_result: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(design_result, dict):
+        return {}
+    keys = (
+        "result_dir",
+        "starting_json",
+        "curriculum_json",
+        "candidate_json",
+        "candidate_zmx",
+        "candidate_png",
+        "final_json",
+        "final_zmx",
+        "final_png",
+        "analysis_json",
+        "log_file",
+    )
+    return {key: design_result[key] for key in keys if design_result.get(key)}
+
+
+def _result_index(result: AgentResult) -> dict[str, Any]:
+    artifacts = {
+        "candidate_json": result.candidate_json,
+        "candidate_zmx": result.candidate_zmx,
+        "candidate_png": result.candidate_png,
+        "final_json": result.final_json,
+        "final_zmx": result.final_zmx,
+        "summary_report": result.summary_report_file,
+    }
+    return {
+        "schema_version": 2,
+        "ok": result.ok,
+        "summary": result.summary,
+        "result_dir": result.result_dir,
+        "artifacts": {key: value for key, value in artifacts.items() if value},
+        "refs": {
+            "evidence": "../../evidence.json",
+            "metrics": "../../metrics.json",
+            "timeline": "../timeline.json",
+            "optimization_trace": "../../agents/optimization/views/turns.json",
+        },
+    }
 
 
 def _seed_candidate_artifact(item: SeedCandidate) -> dict[str, Any]:

@@ -12,7 +12,7 @@ from agent.settings import LensDesignParams
 from engine.deeplens.runtime import ensure_deeplens_import
 
 
-DEEPLENS_ORIGINAL_LRS = [1e-3, 1e-4, 1e-2, 1e-4]
+DEEPLENS_ORIGINAL_LRS = [1e-3, 1e-3, 1e-2, 1e-4]
 
 
 def _deeplens_cosine_schedule_with_warmup(optimizer, num_warmup_steps: int, num_training_steps: int):
@@ -109,6 +109,11 @@ def _as_float(value: object) -> float | None:
         return None
 
 
+def prune_lens_surfaces(lens: object) -> None:
+    """Prune lens surface apertures using the current DeepLens interface."""
+    lens.prune_surf()
+
+
 def optimize_autolens_rms(
     params: LensDesignParams,
     result_dir: str | Path,
@@ -181,7 +186,10 @@ def optimize_autolens_rms(
         spp = int(stage_params.spp)
         if progress_cb:
             progress_cb(f"\u5f00\u59cb\u8bfe\u7a0b\u5b66\u4e60\uff1a\u5171 {int(stage_params.iterations)} \u8f6e\u3002")
-        optimizer = self.get_optimizer(DEEPLENS_ORIGINAL_LRS, optim_mat=True)
+        optimizer = self.get_optimizer(
+            [lr * params.lr_scale for lr in DEEPLENS_ORIGINAL_LRS],
+            optim_mat=True,
+        )
         scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
             optimizer, T_0=int(stage_params.iterations) // 4, T_mult=1
         )
@@ -266,7 +274,10 @@ def optimize_autolens_rms(
         spp = int(stage_params.spp)
         if progress_cb:
             progress_cb(f"\u5f00\u59cb\u4f18\u5316\u5fae\u8c03\uff1a\u5171 {int(stage_params.iterations)} \u8f6e\u3002")
-        optimizer = self.get_optimizer(DEEPLENS_ORIGINAL_LRS, optim_mat=False)
+        optimizer = self.get_optimizer(
+            [lr * params.lr_scale for lr in DEEPLENS_ORIGINAL_LRS],
+            optim_mat=False,
+        )
         scheduler = _deeplens_cosine_schedule_with_warmup(
             optimizer,
             num_warmup_steps=100,
@@ -376,7 +387,7 @@ def optimize_autolens_rms(
     lens.set_target_fov_fnum(rfov=params.fov / 2 / 57.3, fnum=params.fnum)
     lens.set_fnum(params.fnum)
     lens.fine_tune_design(stage_params=params.fine_tune, result_path=f"{result_dir}/fine-tune")
-    lens.prune_surf(expand_factor=0.05)
+    prune_lens_surfaces(lens)
     lens.post_computation()
     lens.write_lens_json(f"{result_dir}/final.json")
     final_zmx = result_dir / "final.zmx"

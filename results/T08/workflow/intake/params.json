@@ -1,0 +1,72 @@
+{
+  "exp_name": "Auto lens design",
+  "seed": null,
+  "foclen": 100.0,
+  "imgh": 21.255656,
+  "fov": 24.0,
+  "fnum": 4.0,
+  "bfl": 25.0,
+  "thickness": 120.0,
+  "surf_list": [
+    [
+      "Spheric",
+      "Spheric"
+    ],
+    [
+      "Spheric",
+      "Spheric"
+    ],
+    [
+      "Spheric",
+      "Spheric",
+      "Spheric"
+    ],
+    [
+      "Aperture"
+    ],
+    [
+      "Spheric",
+      "Spheric",
+      "Spheric"
+    ],
+    [
+      "Spheric",
+      "Aspheric"
+    ],
+    [
+      "Spheric",
+      "Aspheric"
+    ]
+  ],
+  "lr_scale": 1.0,
+  "curriculum": {
+    "iterations": 2000,
+    "test_per_iter": 50,
+    "num_ring": 16,
+    "num_arm": 4,
+    "spp": 512
+  },
+  "fine_tune": {
+    "iterations": 5000,
+    "test_per_iter": 100,
+    "num_ring": 32,
+    "num_arm": 8,
+    "spp": 512
+  },
+  "_meta": {
+    "parameter_sources": {
+      "foclen": "user_input",
+      "fov": "user_input",
+      "fnum": "user_input",
+      "bfl": "user_input",
+      "thickness": "user_input",
+      "surf_list": "suggested_default",
+      "imgh": "derived"
+    },
+    "constraints": {},
+    "budget_sources": {
+      "curriculum": "suggested_default",
+      "fine_tune": "suggested_default"
+    }
+  }
+}

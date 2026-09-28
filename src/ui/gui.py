@@ -20,11 +20,11 @@ os.environ.setdefault("MPLCONFIGDIR", str(PROJECT_ROOT / ".cache" / "matplotlib"
 logging.getLogger("matplotlib").setLevel(logging.ERROR)
 logging.getLogger("matplotlib.font_manager").setLevel(logging.ERROR)
 
-from agent.llm import LLM_PROVIDERS, OPENAI_BASE_URL, OPENAI_MODEL, resolve_provider_id
+from agent.llm import LLM_PROVIDERS, get_runtime_llm_config
 from agent.workflow import LensResearchAgent
 from runtime.artifacts import build_preview_payload as build_runtime_preview_payload
 from runtime.timeline import TimelineCatalog
-from subagents.types import build_agent_input, load_default_params, public_params_dict
+from subagents.types import DEFAULT_OPTIMIZATION_MAX_TURNS, build_agent_input, load_default_params, public_params_dict
 
 
 UI_ROOT = PROJECT_ROOT / "src" / "ui"
@@ -37,20 +37,6 @@ CLIENT_DISCONNECT_ERRORS = (BrokenPipeError, ConnectionResetError, ConnectionAbo
 
 def _cli_task_line(message: str) -> None:
     print(f"[LensBot] {message}", flush=True)
-
-
-def _format_cli_target(payload: dict[str, Any]) -> str:
-    parts = []
-    for key, label, unit in (
-        ("foclen", "EFL", "mm"),
-        ("fnum", "F", ""),
-        ("fov", "FOV", "deg"),
-    ):
-        value = payload.get(key)
-        if value not in (None, ""):
-            parts.append(f"{label} {value}{unit}")
-    return ", ".join(parts) if parts else "\u81ea\u7531\u955c\u5934\u9700\u6c42"
-
 
 
 @dataclass
@@ -85,13 +71,12 @@ def build_agent() -> LensResearchAgent:
 
 def build_defaults_payload() -> dict[str, Any]:
     params = load_default_params(PROJECT_ROOT)
+    llm = get_runtime_llm_config()
     return {
         "params": public_params_dict(params),
+        "optimization": {"max_turns": DEFAULT_OPTIMIZATION_MAX_TURNS},
         "llm": {
-            "model": OPENAI_MODEL,
-            "base_url": OPENAI_BASE_URL,
-            "temperature": float(os.getenv("LENSBOT_OPENAI_TEMPERATURE", "0.3")),
-            "provider": resolve_provider_id(OPENAI_BASE_URL),
+            **llm,
             "providers": LLM_PROVIDERS,
         },
     }
@@ -229,7 +214,7 @@ def _start_run(payload: dict[str, Any]) -> str:
     def worker() -> None:
         started_at = time.monotonic()
         try:
-            state.publish({"event": "progress", **TimelineCatalog().event("run.accepted").for_trace()})
+            state.publish({"event": "progress", **TimelineCatalog().event("run.received").for_trace()})
             run_payload = dict(payload)
             _apply_llm_config(run_payload)
             defaults = load_default_params(PROJECT_ROOT)
@@ -246,9 +231,7 @@ def _start_run(payload: dict[str, Any]) -> str:
             fine_tune.setdefault("test_per_iter", run_payload.get("fine_tune_test_per_iter", defaults.fine_tune.test_per_iter))
             run_payload["fine_tune"] = {key: value for key, value in fine_tune.items() if value is not None}
             agent_input = build_agent_input(PROJECT_ROOT, payload=run_payload)
-            _cli_task_line(
-                f"\u4efb\u52a1 {run_id} \u5df2\u542f\u52a8\uff1a{_format_cli_target(run_payload)}\u3002\u5149\u5b66\u53f0\u5df2\u5c31\u7eea\u3002"
-            )
+            _cli_task_line("\u5149\u5b66\u8bbe\u8ba1\u5e73\u53f0\u5df2\u5c31\u7eea\u3002")
 
             def publish_artifact(result_dir: str) -> None:
                 state.publish(
@@ -273,6 +256,7 @@ def _start_run(payload: dict[str, Any]) -> str:
                 progress_cb=lambda payload: state.publish({"event": "progress", **payload}),
                 artifact_cb=publish_artifact,
                 reference_cb=publish_references,
+                transcript_cb=lambda row: state.publish({"event": "transcript", "transcript": row}),
             )
             state.publish(
                 {
@@ -283,6 +267,12 @@ def _start_run(payload: dict[str, Any]) -> str:
                     "result_dir_url": _result_file_url(Path(result.result_dir)) if result.result_dir else None,
                     "curriculum_json": _display_workspace_path(result.curriculum_json),
                     "curriculum_json_url": _result_file_url(Path(result.curriculum_json)) if result.curriculum_json else None,
+                    "candidate_json": _display_workspace_path(result.candidate_json),
+                    "candidate_json_url": _result_file_url(Path(result.candidate_json)) if result.candidate_json else None,
+                    "candidate_zmx": _display_workspace_path(result.candidate_zmx),
+                    "candidate_zmx_url": _result_file_url(Path(result.candidate_zmx)) if result.candidate_zmx else None,
+                    "candidate_png": _display_workspace_path(result.candidate_png),
+                    "candidate_png_url": _result_file_url(Path(result.candidate_png)) if result.candidate_png else None,
                     "final_json": _display_workspace_path(result.final_json),
                     "final_json_url": _result_file_url(Path(result.final_json)) if result.final_json else None,
                     "final_zmx": _display_workspace_path(result.final_zmx),
@@ -300,11 +290,13 @@ def _start_run(payload: dict[str, Any]) -> str:
                 }
             )
             elapsed = time.monotonic() - started_at
-            verdict = "\u5df2\u5b8c\u6210" if result.ok else "\u5df2\u5b8c\u6210\uff0c\u4f46\u9700\u7559\u610f"
-            _cli_task_line(f"\u4efb\u52a1 {run_id} {verdict}\uff0c\u7528\u65f6 {elapsed:.1f}s\u3002")
+            if result.ok:
+                _cli_task_line(f"任务 {run_id} 已完成，用时 {elapsed:.1f}s。")
+            else:
+                _cli_task_line(f"任务 {run_id} 失败，用时 {elapsed:.1f}s。原因：{result.summary or '未返回失败原因'}")
         except Exception as exc:  # pragma: no cover - UI boundary
             elapsed = time.monotonic() - started_at
-            _cli_task_line(f"\u4efb\u52a1 {run_id} \u5728 {elapsed:.1f}s \u540e\u505c\u6b62\uff1a{exc}")
+            _cli_task_line(f"任务 {run_id} 失败，用时 {elapsed:.1f}s。原因：{type(exc).__name__}: {exc}")
             state.publish({"event": "run_error", **TimelineCatalog().event("run.error", error=exc).for_trace()})
         finally:
             state.publish({"event": "done"})

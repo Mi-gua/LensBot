@@ -1,17 +1,20 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import mimetypes
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from runtime.evidence import build_result_evidence
 from runtime.result import layered_workspace_index
 from runtime.traces import load_trace_payload
 
 
 DisplayUrlBuilder = Callable[[Path | None], str | None]
 DisplayPathBuilder = Callable[[str | None], str | None]
+_HASH_CACHE: dict[tuple[str, int, int], str] = {}
 
 
 @dataclass
@@ -28,6 +31,8 @@ class ArtifactRecord:
     order: int = 100
     mime_type: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
+    aliases: list[dict[str, str]] = field(default_factory=list)
+    content_sha256: str = ""
 
     def to_json(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -52,10 +57,10 @@ def refresh_run_manifest(
     if trim_transient:
         prune_transient_outputs(root)
 
-    artifacts = _discover_key_artifacts(root)
+    artifacts = _dedupe_artifacts(_discover_key_artifacts(root))
     layers = layered_workspace_index(root)
     payload = {
-        "schema_version": 2,
+        "schema_version": 3,
         "result_dir": str(root.resolve()),
         "phase": phase or _load_session_phase(root),
         "params": params or _load_session_params(root),
@@ -90,18 +95,28 @@ def build_preview_payload(
     optimization_stages = _optimization_stages(root, traces)
     zemax_figures = [
         item
-        for role in ("zemax_mtf", "zemax_spot_summary", "zemax_spot_diagram", "zemax_summary")
+        for role in (
+            "zemax_mtf",
+            "zemax_distortion",
+            "zemax_spot_diagram",
+        )
         for item in by_role.get(role, [])[:1]
     ]
 
     starting_json = _first_path(by_role, "deeplens_adjusted_structure_json") or _first_path(by_role, "deeplens_starting_json")
+    candidate_json = _first_path(by_role, "deeplens_candidate_json")
     final_json = _first_path(by_role, "deeplens_final_json")
     starting_data = _load_json_dict(Path(starting_json)) if starting_json else {}
-    final_data = _load_json_dict(Path(final_json)) if final_json else {}
+    final_data = _load_json_dict(Path(final_json or candidate_json)) if (final_json or candidate_json) else {}
     zemax_report = _first(by_role, "zemax_report")
     zemax_report_data = _load_json_dict(Path(zemax_report["path"])) if zemax_report else {}
     zemax_status = _zemax_status(metric_map, zemax_report_data)
     zemax_error = metric_map.get("zemax_error") or zemax_report_data.get("error") or zemax_report_data.get("spot_diagram_error")
+    evidence = _load_json_dict(root / "evidence.json")
+    if not evidence.get("delivery") or not evidence.get("verdict"):
+        evidence = build_result_evidence(root, metric_map)
+    final_image_url = _first_url(by_role, "deeplens_final_image")
+    candidate_image_url = _first_distinct_url(by_role, "deeplens_candidate_image", final_image_url)
 
     payload = {
         "artifacts": artifacts,
@@ -109,25 +124,25 @@ def build_preview_payload(
         "agent_trace": traces.get("agent", []),
         "deeplens_progress": _deeplens_progress(root),
         "starting_image_url": _first_url(by_role, "deeplens_adjusted_structure_image") or _first_url(by_role, "deeplens_starting_image"),
-        "curriculum_image_url": _first_url(by_role, "deeplens_current_image") or _first_url(by_role, "deeplens_curriculum_image"),
-        "final_image_url": _first_url(by_role, "deeplens_final_image"),
+        "current_image_url": _first_url(by_role, "deeplens_current_image"),
+        "curriculum_image_url": _first_url(by_role, "deeplens_curriculum_image"),
+        "candidate_image_url": candidate_image_url,
+        "final_image_url": final_image_url,
         "starting_json_path": _first_display_path(by_role, "deeplens_adjusted_structure_json") or _first_display_path(by_role, "deeplens_starting_json"),
         "starting_json_url": _first_url(by_role, "deeplens_adjusted_structure_json") or _first_url(by_role, "deeplens_starting_json"),
         "foclen_display": _format_value(final_data.get("foclen") or starting_data.get("foclen"), " mm"),
         "fnum_display": _format_value(_preview_fnum(metric_map, final_data, starting_data)),
         "fov_display": _format_value(_preview_fov_deg(metric_map), " deg"),
-        "r_sensor_display": _format_value(
-            metric_map.get("r_sensor") or final_data.get("r_sensor") or starting_data.get("r_sensor"),
-            " mm",
-        ),
-        "structure_group_count_display": _format_value(metric_map.get("structure_group_count"), "", 0),
         "optimization_stages": optimization_stages,
-        "zemax_figures": zemax_figures[:3],
+        "zemax_figures": zemax_figures,
         "zemax_status": zemax_status,
         "zemax_status_label": _zemax_status_label(zemax_status),
         "zemax_error": zemax_error,
         "zemax_report_path": zemax_report.get("display_path") if zemax_report else None,
         "zemax_report_url": zemax_report.get("url") if zemax_report else None,
+        "evidence": evidence,
+        "evidence_path": _first_display_path(by_role, "result_evidence"),
+        "evidence_url": _first_url(by_role, "result_evidence"),
     }
     return payload
 
@@ -172,22 +187,26 @@ def _discover_key_artifacts(root: Path) -> list[ArtifactRecord]:
             )
         )
 
-    curriculum_dir = Path("engines") / "deeplens" / "attempts" / "attempt-001-curriculum"
     live_dir = Path("engines") / "deeplens" / "live"
     final_dir = Path("final")
-    add(curriculum_dir / "starting-point.json", kind="lens_json", role="deeplens_starting_json", source="deeplens", stage="starting", title="Starting lens JSON", order=10)
-    add(curriculum_dir / "starting-point.png", kind="image", role="deeplens_starting_image", source="deeplens", stage="starting", title="Starting structure", order=11)
+    add(_latest_attempt_artifact(root, "starting-point.json"), kind="lens_json", role="deeplens_starting_json", source="deeplens", stage="starting", title="Starting lens JSON", order=10)
+    add(_latest_attempt_artifact(root, "starting-point.png"), kind="image", role="deeplens_starting_image", source="deeplens", stage="starting", title="Starting structure", order=11)
     add(live_dir / "adjusted-structure.json", kind="lens_json", role="deeplens_adjusted_structure_json", source="deeplens", stage="starting", title="Adjusted structure JSON", order=12)
     add(live_dir / "adjusted-structure.png", kind="image", role="deeplens_adjusted_structure_image", source="deeplens", stage="starting", title="Adjusted structure", order=13)
     add(live_dir / "current.json", kind="lens_json", role="deeplens_current_json", source="deeplens", stage="optimization", title="Current lens JSON", order=20)
     add(live_dir / "current.png", kind="image", role="deeplens_current_image", source="deeplens", stage="optimization", title="Current optimization snapshot", order=21)
-    add(curriculum_dir / "curriculum.json", kind="lens_json", role="deeplens_curriculum_json", source="deeplens", stage="curriculum", title="Curriculum lens JSON", order=30)
-    add(curriculum_dir / "curriculum.png", kind="image", role="deeplens_curriculum_image", source="deeplens", stage="curriculum", title="Curriculum result", order=31)
+    add(_latest_attempt_artifact(root, "curriculum.json"), kind="lens_json", role="deeplens_curriculum_json", source="deeplens", stage="curriculum", title="Curriculum lens JSON", order=30)
+    add(_latest_attempt_artifact(root, "curriculum.png"), kind="image", role="deeplens_curriculum_image", source="deeplens", stage="curriculum", title="Curriculum result", order=31)
+    add(_latest_candidate_artifact(root, "lens.json"), kind="lens_json", role="deeplens_candidate_json", source="deeplens", stage="candidate", title="Candidate lens JSON", order=35)
+    add(_latest_candidate_artifact(root, "lens.png"), kind="image", role="deeplens_candidate_image", source="deeplens", stage="candidate", title="Candidate result", order=36)
+    add(_latest_candidate_artifact(root, "lens.zmx"), kind="lens_zmx", role="deeplens_candidate_zmx", source="deeplens", stage="candidate", title="Candidate Zemax lens", order=37)
     add(final_dir / "final.json", kind="lens_json", role="deeplens_final_json", source="deeplens", stage="final", title="Final lens JSON", order=40)
     add(final_dir / "final.png", kind="image", role="deeplens_final_image", source="deeplens", stage="final", title="Final structure", order=41)
     add(final_dir / "final.zmx", kind="lens_zmx", role="zemax_lens_file", source="deeplens", stage="final", title="Zemax lens file", order=42)
+    add("evidence.json", kind="evidence", role="result_evidence", source="workflow", stage="reporting", title="Canonical result evidence", order=60)
     add("metrics.json", kind="metrics", role="metrics", source="workflow", stage="reporting", title="Metrics file", order=70)
     add("summary.md", kind="report", role="summary_report", source="workflow", stage="reporting", title="Summary report", order=71)
+    add("report.html", kind="report", role="html_review_report", source="workflow", stage="reporting", title="Optical lens design summary report", order=72)
     add("workflow/timeline.json", kind="timeline", role="workflow_timeline", source="workflow", stage="workflow", title="Workflow timeline", order=72)
     add("agents/optimization/ledger/events.jsonl", kind="ledger", role="optimization_agent_ledger", source="optimization-agent", stage="optimization", title="Optimization agent ledger", order=73)
     add("agents/optimization/views/turns.json", kind="view", role="optimization_agent_turns_view", source="optimization-agent", stage="optimization", title="Optimization agent turns view", order=74)
@@ -199,16 +218,110 @@ def _discover_key_artifacts(root: Path) -> list[ArtifactRecord]:
     add("manifest.json", kind="manifest", role="manifest", source="runtime", stage="runtime", title="Artifact manifest", order=90)
 
     zemax_specs = [
-        ("fft_mtf.png", "zemax_mtf", "FFT MTF", "Tangential and sagittal MTF from OpticStudio", 50),
-        ("spot_summary.png", "zemax_spot_summary", "Spot radius", "RMS and geometric spot radius by field", 51),
-        ("spot_diagram.png", "zemax_spot_diagram", "Spot diagram", "Ray point cloud relative to centroid", 52),
-        ("zemax_summary.png", "zemax_summary", "Zemax summary", "Fallback overview when spot tracing is unavailable", 53),
+        ("fft_mtf.png", "zemax_mtf", "FFT MTF", "Polychromatic tangential and sagittal MTF from OpticStudio", 50),
+        ("distortion.png", "zemax_distortion", "Distortion vectors", "Image-space residual vectors from native OpticStudio grid distortion", 51),
+        ("spot_diagram.png", "zemax_spot_diagram", "Spot diagram", "Polychromatic ray point cloud with valid-ray counts", 52),
     ]
     for filename, role, title, subtitle, order in zemax_specs:
         add(Path("verification") / "zemax" / filename, kind="image", role=role, source="zemax", stage="analysis", title=title, subtitle=subtitle, order=order)
     add("verification/zemax/zemax_report.json", kind="report", role="zemax_report", source="zemax", stage="analysis", title="Zemax analysis report", order=54)
+    add("verification/zemax/grid_distortion.txt", kind="report", role="zemax_grid_distortion_report", source="zemax", stage="analysis", title="Native grid distortion report", order=55)
 
     return sorted(records, key=lambda item: (item.order, item.role, item.path))
+
+
+def _dedupe_artifacts(records: list[ArtifactRecord]) -> list[ArtifactRecord]:
+    """Collapse byte-identical deliverables while retaining their roles as aliases."""
+
+    canonical: dict[tuple[str, str], ArtifactRecord] = {}
+    untouched: list[ArtifactRecord] = []
+    for record in records:
+        if record.kind not in {"lens_json", "lens_zmx", "image"}:
+            untouched.append(record)
+            continue
+        digest = _file_sha256(Path(record.path))
+        if not digest:
+            untouched.append(record)
+            continue
+        record.content_sha256 = digest
+        key = (record.kind, digest)
+        existing = canonical.get(key)
+        if existing is None:
+            canonical[key] = record
+            continue
+        winner, alias = _preferred_artifact(existing, record)
+        winner.aliases = [*winner.aliases, *_artifact_aliases(alias)]
+        canonical[key] = winner
+    return sorted([*untouched, *canonical.values()], key=lambda item: (item.order, item.role, item.path))
+
+
+def _preferred_artifact(left: ArtifactRecord, right: ArtifactRecord) -> tuple[ArtifactRecord, ArtifactRecord]:
+    priority = {"final": 5, "analysis": 4, "reporting": 3, "candidate": 2, "optimization": 1}
+    if priority.get(right.stage, 0) > priority.get(left.stage, 0):
+        return right, left
+    return left, right
+
+
+def _artifact_aliases(record: ArtifactRecord) -> list[dict[str, str]]:
+    return [
+        *record.aliases,
+        {"role": record.role, "path": record.path, "stage": record.stage, "title": record.title},
+    ]
+
+
+def _file_sha256(path: Path) -> str:
+    try:
+        stat = path.stat()
+        cache_key = (str(path.resolve()), stat.st_size, stat.st_mtime_ns)
+        if cache_key in _HASH_CACHE:
+            return _HASH_CACHE[cache_key]
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        value = digest.hexdigest()
+        _HASH_CACHE[cache_key] = value
+        return value
+    except OSError:
+        return ""
+
+
+def _latest_attempt_artifact(root: Path, filename: str) -> Path:
+    attempts_root = root / "engines" / "deeplens" / "attempts"
+    candidates = [path for path in attempts_root.glob(f"attempt-*-*/{filename}") if path.is_file()]
+    if not candidates:
+        return attempts_root / filename
+    return max(candidates, key=_attempt_index)
+
+
+def _latest_candidate_artifact(root: Path, filename: str) -> Path:
+    candidates_root = root / "candidates"
+    candidates = [path for path in candidates_root.glob(f"candidate-*/{filename}") if path.is_file()]
+    if not candidates:
+        return candidates_root / filename
+    return max(candidates, key=_candidate_index)
+
+
+def _attempt_index(path: Path) -> int:
+    for part in path.parts:
+        if part.startswith("attempt-"):
+            pieces = part.split("-", 2)
+            if len(pieces) >= 2:
+                try:
+                    return int(pieces[1])
+                except ValueError:
+                    return 0
+    return 0
+
+
+def _candidate_index(path: Path) -> int:
+    for part in path.parts:
+        if part.startswith("candidate-"):
+            try:
+                return int(part.split("-", 1)[1])
+            except (IndexError, ValueError):
+                return 0
+    return 0
 
 
 def _attach_display_fields(
@@ -227,6 +340,9 @@ def _by_role(artifacts: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]
     by_role: dict[str, list[dict[str, Any]]] = {}
     for item in artifacts:
         by_role.setdefault(str(item.get("role") or ""), []).append(item)
+        for alias in item.get("aliases") or []:
+            if isinstance(alias, dict) and alias.get("role"):
+                by_role.setdefault(str(alias["role"]), []).append(item)
     return by_role
 
 
@@ -238,6 +354,15 @@ def _first(by_role: dict[str, list[dict[str, Any]]], role: str) -> dict[str, Any
 def _first_url(by_role: dict[str, list[dict[str, Any]]], role: str) -> str | None:
     item = _first(by_role, role)
     return item.get("url") if item else None
+
+
+def _first_distinct_url(
+    by_role: dict[str, list[dict[str, Any]]],
+    role: str,
+    excluded_url: str | None,
+) -> str | None:
+    url = _first_url(by_role, role)
+    return url if url and url != excluded_url else None
 
 
 def _first_path(by_role: dict[str, list[dict[str, Any]]], role: str) -> str | None:

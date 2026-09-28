@@ -94,9 +94,8 @@ class ZemaxAnalysisTool:
 def _figure_role(key: Any) -> str:
     return {
         "fft_mtf": "zemax_mtf",
-        "spot_summary": "zemax_spot_summary",
+        "distortion": "zemax_distortion",
         "spot_diagram": "zemax_spot_diagram",
-        "zemax_summary": "zemax_summary",
     }.get(str(key or ""), "zemax_figure")
 
 

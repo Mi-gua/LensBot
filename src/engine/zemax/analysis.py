@@ -1,18 +1,20 @@
 from __future__ import annotations
 
 import json
-import math
 import os
 import random
-import re
 from itertools import islice
 from pathlib import Path
 from typing import Any, Callable
 
+from .plotting import plot_report
+
 
 MTF_FULL_MAX_FREQUENCY_CY_MM = 50.0
-MTF_DIAGNOSTIC_MIN_XMAX_CY_MM = 15.0
-MTF_DIAGNOSTIC_MTF50_SCALE = 2.5
+ZEMAX_STANDARD_SPOT_UNIT = "um"
+ZEMAX_STANDARD_SPOT_UNIT_SOURCE = "zosapi_standard_spot"
+SPOT_DIAGRAM_UNIT = "um"
+SPOT_DIAGRAM_SOURCE = "zosapi_batch_ray_trace"
 
 
 class PythonStandaloneApplication:
@@ -123,67 +125,20 @@ def _as_float_list(values: Any) -> list[float]:
     return [float(value) for value in list(values)]
 
 
-def _first_non_empty_string(*values: Any) -> str | None:
-    for value in values:
-        if value is None:
-            continue
-        text = str(value).strip()
-        if text:
-            return text
-    return None
-
-
-def _safe_getattr(obj: Any, name: str) -> Any:
-    try:
-        return getattr(obj, name)
-    except Exception:
-        return None
-
-
-def _extract_field_label(series: Any, series_index: int) -> str:
-    description = _first_non_empty_string(
-        _safe_getattr(series, "Description"),
-        _safe_getattr(series, "SeriesLabel"),
-        _safe_getattr(series, "Label"),
-    )
-    if description:
-        return description
-    return f"Field {series_index + 1}"
-
-
-def _extract_frequency_axis_metadata(analysis: Any, results: Any) -> dict[str, str]:
-    x_label = _first_non_empty_string(
-        _safe_getattr(results, "XLabel"),
-        _safe_getattr(analysis, "XLabel"),
-        "Spatial frequency",
-    )
-    x_unit = _first_non_empty_string(
-        _safe_getattr(results, "XUnits"),
-        _safe_getattr(analysis, "XUnits"),
-    )
-
-    label_lower = x_label.lower()
-    if x_unit and x_unit.lower() not in label_lower:
-        axis_label = f"{x_label} ({x_unit})"
-    else:
-        axis_label = x_label
-
-    return {
-        "frequency_axis_label": axis_label,
-        "frequency_unit": x_unit or "unknown",
+def _lens_unit_to_micrometers_scale(lens_unit: Any) -> float:
+    scales = {
+        "millimeters": 1_000.0,
+        "centimeters": 10_000.0,
+        "meters": 1_000_000.0,
+        "inches": 25_400.0,
     }
-
-
-def _clean_field_label_for_legend(field_label: str, field_index: int) -> str:
-    text = field_label.strip()
-    if not text:
-        return f"Field {field_index + 1}"
-
-    match = re.search(r"[-+]?\d+(?:\.\d+)?", text)
-    if match:
-        return f"Field {field_index + 1} ({match.group(0)})"
-
-    return text
+    normalized_unit = str(lens_unit).strip().lower()
+    try:
+        return scales[normalized_unit]
+    except KeyError as exc:
+        raise RuntimeError(
+            f"Unsupported OpticStudio lens unit for spot diagram: {lens_unit}"
+        ) from exc
 
 
 def _mtf50(freq_values: list[float], mtf_values: list[float]) -> float | None:
@@ -195,7 +150,11 @@ def _mtf50(freq_values: list[float], mtf_values: list[float]) -> float | None:
         if mtf > 0.5:
             continue
         if index == 0:
-            return float(pairs[0][0])
+            x1, y1 = 0.0, 1.0
+            x2, y2 = pairs[0]
+            if abs(y2 - y1) < 1e-12:
+                return float(x2)
+            return float(x1 + (0.5 - y1) / (y2 - y1) * (x2 - x1))
 
         x1, y1 = pairs[index - 1]
         x2, y2 = pairs[index]
@@ -205,7 +164,7 @@ def _mtf50(freq_values: list[float], mtf_values: list[float]) -> float | None:
         t = (0.5 - y1) / (y2 - y1)
         return float(x1 + t * (x2 - x1))
 
-    return float(pairs[-1][0])
+    return None
 
 
 def summarize_mtf_metrics(mtf_series: list[dict[str, Any]]) -> dict[str, Any]:
@@ -238,55 +197,53 @@ def summarize_mtf_metrics(mtf_series: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _get_primary_wavelength_number(system: Any) -> int:
-    wavelengths = _safe_getattr(system.SystemData, "Wavelengths")
-    primary = _safe_getattr(wavelengths, "PrimaryWavelength")
-    try:
-        value = int(primary)
-        return value if value > 0 else 1
-    except (TypeError, ValueError):
-        return 1
+    wavelengths = system.SystemData.Wavelengths
+    for number in range(1, int(wavelengths.NumberOfWavelengths) + 1):
+        wavelength = wavelengths.GetWavelength(number)
+        if wavelength.IsPrimary:
+            return int(wavelength.WavelengthNumber)
+    raise RuntimeError("OpticStudio system has no primary wavelength.")
 
 
-def _get_operand_value(
-    zos: PythonStandaloneApplication,
-    system: Any,
-    operand_name: str,
-    *args: Any,
-) -> float | None:
-    try:
-        operand_type = getattr(zos.ZOSAPI.Editors.MFE.MeritOperandType, operand_name)
-        padded_args = list(args[:8]) + [0] * max(0, 8 - len(args))
-        return float(system.MFE.GetOperandValue(operand_type, *padded_args[:8]))
-    except Exception:
-        return None
+def _read_native_first_order_data(system: Any) -> dict[str, float]:
+    efl, paraxial_fnum, real_fnum, image_height, magnification = (
+        system.LDE.GetFirstOrderData(0.0, 0.0, 0.0, 0.0, 0.0)
+    )
+    return {
+        "efl_mm": float(efl),
+        "paraxial_working_fnum": float(paraxial_fnum),
+        "real_working_fnum": float(real_fnum),
+        "paraxial_image_height_mm": float(image_height),
+        "paraxial_magnification": float(magnification),
+    }
 
 
-def _load_deeplens_sidecar(lens_file: Path) -> dict[str, Any]:
-    sidecar = lens_file.with_suffix(".json")
-    if not sidecar.exists():
-        return {}
-    try:
-        data = json.loads(sidecar.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
-def _coerce_float(value: Any) -> float | None:
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return None
-    if not math.isfinite(number):
-        return None
-    return number
-
-
-def _reasonable_fnum(value: Any) -> float | None:
-    number = _coerce_float(value)
-    if number is None or number <= 0 or number > 1000:
-        return None
-    return number
+def _read_native_pupil_data(
+    zos: PythonStandaloneApplication, system: Any
+) -> dict[str, Any]:
+    apodization_none = getattr(
+        zos.ZOSAPI.Editors.LDE.PupilApodizationType, "None"
+    )
+    values = system.LDE.GetPupil(
+        system.SystemData.Aperture.ApertureType,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        apodization_none,
+        0.0,
+    )
+    return {
+        "aperture_type": str(values[0]),
+        "aperture_value": float(values[1]),
+        "entrance_pupil_diameter_mm": float(values[2]),
+        "entrance_pupil_position_mm": float(values[3]),
+        "exit_pupil_diameter_mm": float(values[4]),
+        "exit_pupil_position_mm": float(values[5]),
+        "apodization_type": str(values[6]),
+        "apodization_factor": float(values[7]),
+    }
 
 
 def get_field_summary(system: Any) -> dict[str, Any]:
@@ -307,7 +264,7 @@ def get_field_summary(system: Any) -> dict[str, Any]:
         )
 
     max_radius = max((item["radius"] for item in values), default=0.0)
-    field_type = str(_safe_getattr(fields, "FieldType") or "")
+    field_type = str(fields.GetFieldType())
     return {
         "field_type": field_type,
         "fields": values,
@@ -319,49 +276,33 @@ def get_field_summary(system: Any) -> dict[str, Any]:
 def get_system_metrics(
     zos: PythonStandaloneApplication,
     system: Any,
-    lens_file: str | Path | None = None,
 ) -> dict[str, Any]:
-    image_surface = int(system.LDE.NumberOfSurfaces)
     wavelength = _get_primary_wavelength_number(system)
     field_summary = get_field_summary(system)
-    sidecar = _load_deeplens_sidecar(Path(lens_file)) if lens_file else {}
-
-    efl = _get_operand_value(zos, system, "EFFL", 0, wavelength, 0, 0, 0, 0, 0, 0)
-    if efl is None:
-        efl = _get_operand_value(zos, system, "EFLY", 0, wavelength, 0, 0, 0, 0, 0, 0)
-
-    fnum_operand = _get_operand_value(zos, system, "FNUM", 0, wavelength, 0, 0, 0, 0, 0, 0)
-    fnum = _reasonable_fnum(fnum_operand)
-    fnum_source = "zemax_operand"
-    if fnum is None:
-        fnum = _reasonable_fnum(sidecar.get("fnum"))
-        fnum_source = "deeplens_sidecar" if fnum is not None else "unavailable"
-    if fnum is None and efl:
-        aperture_value = _safe_getattr(system.SystemData.Aperture, "ApertureValue")
-        try:
-            aperture_value = float(aperture_value)
-            if aperture_value > 0:
-                fnum = _reasonable_fnum(abs(float(efl)) / aperture_value)
-                if fnum is not None:
-                    fnum_source = "efl_over_aperture"
-        except (TypeError, ValueError):
-            pass
+    first_order = _read_native_first_order_data(system)
+    pupil = _read_native_pupil_data(zos, system)
 
     return {
-        "efl_mm": efl,
-        "fnum": fnum,
-        "fnum_source": fnum_source,
-        "fnum_operand_raw": fnum_operand,
+        "metric_source": "zemax_zosapi",
+        "primary_wavelength_number": wavelength,
+        "efl_mm": first_order["efl_mm"],
+        "efl_unit": "mm",
+        "efl_source": "zosapi_first_order_data",
+        "fnum": first_order["paraxial_working_fnum"],
+        "fnum_source": "zosapi_first_order_paraxial_working_fnum",
+        "real_working_fnum": first_order["real_working_fnum"],
+        "paraxial_image_height_mm": first_order["paraxial_image_height_mm"],
+        "paraxial_magnification": first_order["paraxial_magnification"],
+        "pupil": pupil,
         "fov_deg": field_summary["fov_deg"],
+        "fov_unit": "deg",
+        "fov_source": "zemax_field_data",
         "field_type": field_summary["field_type"],
         "fields": field_summary["fields"],
         "distortion": get_distortion_metrics(
             zos,
             system,
-            image_surface=image_surface,
             wavelength=wavelength,
-            field_summary=field_summary,
-            efl_mm=efl,
         ),
     }
 
@@ -370,150 +311,219 @@ def get_distortion_metrics(
     zos: PythonStandaloneApplication,
     system: Any,
     *,
-    image_surface: int,
     wavelength: int,
-    field_summary: dict[str, Any],
-    efl_mm: float | None,
 ) -> dict[str, Any]:
-    max_field = float(field_summary.get("max_field") or 0.0)
-    values = []
-    for field in field_summary.get("fields", []):
-        if max_field > 0:
-            hx = float(field["x"]) / max_field
-            hy = float(field["y"]) / max_field
-        else:
-            hx = 0.0
-            hy = 0.0
-        value = None
-        actual_y = _get_operand_value(
-            zos,
-            system,
-            "REAY",
-            image_surface,
-            wavelength,
-            0,
-            hy,
-            0,
-            0,
-            0,
-            0,
-        )
-        if actual_y is not None and efl_mm and abs(float(field["y"])) > 1e-12:
-            ideal_y = abs(float(efl_mm)) * math.tan(math.radians(abs(float(field["y"]))))
-            if abs(ideal_y) > 1e-12:
-                value = (abs(float(actual_y)) / ideal_y - 1.0) * 100.0
-
-        if value is None:
-            value = _get_operand_value(
-                zos,
-                system,
-                "DIST",
-                image_surface,
-                wavelength,
-                hx,
-                hy,
-                0,
-                0,
-                0,
-                0,
+    analysis = system.Analyses.New_FieldCurvatureAndDistortion()
+    try:
+        settings = (
+            zos.ZOSAPI.Analysis.Settings.Aberrations.IAS_FieldCurvatureAndDistortion(
+                analysis.GetSettings()
             )
-        values.append(
+        )
+        settings.Wavelength.SetWavelengthNumber(wavelength)
+        settings.IgnoreVignette = False
+        analysis.ApplyAndWaitForCompletion()
+        series = analysis.GetResults().GetDataSeries(0)
+        fields = _as_float_list(series.XData.Data)
+        data = zos.reshape(
+            series.YData.Data,
+            series.YData.Data.GetLength(0),
+            series.YData.Data.GetLength(1),
+            True,
+        )
+        distortion = [_as_float(value) for value in data[-1]]
+        return {
+            "field_samples_deg": fields,
+            "distortion_pct": distortion,
+            "edge_pct": distortion[-1],
+            "abs_max_pct": max(abs(value) for value in distortion),
+            "unit": "percent",
+            "definition": "OpticStudio Field Curvature and Distortion analysis",
+            "source": "zosapi_field_curvature_and_distortion",
+        }
+    finally:
+        analysis.Close()
+
+
+def _parse_grid_distortion_text(text: str) -> dict[str, Any]:
+    points = []
+    for line in text.splitlines():
+        columns = line.replace("%", "").split()
+        if len(columns) != 10:
+            continue
+        try:
+            values = [float(value) for value in columns]
+        except ValueError:
+            continue
+        points.append(
             {
-                "field": field["field"],
-                "distortion_pct": value,
-                "actual_image_y": actual_y,
-                "field_y_deg": field["y"],
+                "i": int(values[0]),
+                "j": int(values[1]),
+                "field_x": values[2],
+                "field_y": values[3],
+                "field_radius": values[4],
+                "predicted_x": values[5],
+                "predicted_y": values[6],
+                "actual_x": values[7],
+                "actual_y": values[8],
+                "distortion_pct": values[9],
             }
         )
 
-    finite_values = [
-        abs(float(item["distortion_pct"]))
-        for item in values
-        if item.get("distortion_pct") is not None
-    ]
+    if not points:
+        raise RuntimeError("OpticStudio Grid Distortion returned no numeric points.")
+
+    distortion_values = [float(point["distortion_pct"]) for point in points]
     return {
-        "by_field": values,
-        "edge_pct": values[-1]["distortion_pct"] if values else None,
-        "abs_max_pct": max(finite_values) if finite_values else None,
+        "points": points,
+        "max_abs_pct": max(abs(value) for value in distortion_values),
+        "rms_pct": (
+            sum(value * value for value in distortion_values)
+            / len(distortion_values)
+        )
+        ** 0.5,
     }
 
 
-def get_fft_mtf_metrics(zos: PythonStandaloneApplication, system: Any) -> list[dict[str, Any]]:
-    analysis = system.Analyses.New_FftMtf()
+def get_grid_distortion_metrics(
+    zos: PythonStandaloneApplication,
+    system: Any,
+    *,
+    wavelength: int,
+    text_path: Path,
+) -> dict[str, Any]:
+    analysis = system.Analyses.New_GridDistortion()
     try:
-        settings = analysis.GetSettings()
-        settings.MaximumFrequency = MTF_FULL_MAX_FREQUENCY_CY_MM
-        settings.SampleSize = zos.ZOSAPI.Analysis.SampleSizes.S_256x256
-
+        settings = zos.ZOSAPI.Analysis.Settings.Aberrations.IAS_GridDistortion(
+            analysis.GetSettings()
+        )
+        settings.Wavelength.SetWavelengthNumber(wavelength)
+        settings.GridNumber = 9
         analysis.ApplyAndWaitForCompletion()
-        results = analysis.GetResults()
-        axis_metadata = _extract_frequency_axis_metadata(analysis, results)
 
-        metrics = []
-        for series_index in range(results.NumberOfDataSeries):
-            series = results.GetDataSeries(series_index)
-            x_values = _as_float_list(series.XData.Data)
-            y_values = zos.reshape(
-                series.YData.Data,
-                series.YData.Data.GetLength(0),
-                series.YData.Data.GetLength(1),
-                True,
-            )
+        text_path.parent.mkdir(parents=True, exist_ok=True)
+        if not analysis.GetResults().GetTextFile(str(text_path)):
+            raise RuntimeError("OpticStudio Grid Distortion text export failed.")
 
-            tangential = [_as_float(value) for value in y_values[0]] if len(y_values) > 0 else []
-            sagittal = [_as_float(value) for value in y_values[1]] if len(y_values) > 1 else []
-
-            metrics.append(
-                {
-                    "series_index": int(series_index),
-                    "field_label": _extract_field_label(series, series_index),
-                    "frequency_axis_label": axis_metadata["frequency_axis_label"],
-                    "frequency_unit": axis_metadata["frequency_unit"],
-                    "frequency_values": x_values,
-                    "frequency_cycles_per_mm": x_values,
-                    "tangential": tangential,
-                    "sagittal": sagittal,
-                }
-            )
-
+        metrics = _parse_grid_distortion_text(
+            text_path.read_text(encoding="utf-16")
+        )
+        metrics.update(
+            {
+                "source": "zosapi_grid_distortion",
+                "definition": "OpticStudio Grid Distortion analysis",
+                "wavelength_number": wavelength,
+                "coordinate_unit": str(system.SystemData.Units.LensUnits),
+                "text_file": str(text_path),
+            }
+        )
         return metrics
     finally:
         analysis.Close()
 
 
-def get_spot_metrics(zos: PythonStandaloneApplication, system: Any) -> list[dict[str, Any]]:
-    analysis = system.Analyses.New_Analysis(
-        zos.ZOSAPI.Analysis.AnalysisIDM.StandardSpot
-    )
+def _read_mtf_series(
+    zos: PythonStandaloneApplication, analysis: Any
+) -> list[dict[str, Any]]:
+    results = analysis.GetResults()
+    metrics = []
+    for series_index in range(results.NumberOfDataSeries):
+        series = results.GetDataSeries(series_index)
+        x_values = _as_float_list(series.XData.Data)
+        y_values = zos.reshape(
+            series.YData.Data,
+            series.YData.Data.GetLength(0),
+            series.YData.Data.GetLength(1),
+            True,
+        )
+        metrics.append(
+            {
+                "series_index": int(series_index),
+                "field_label": str(series.Description),
+                "frequency_axis_label": "Spatial frequency (cycles/mm)",
+                "frequency_unit": "cycles/mm",
+                "frequency_values": x_values,
+                "tangential": [_as_float(value) for value in y_values[0]],
+                "sagittal": [_as_float(value) for value in y_values[1]],
+            }
+        )
+
+    if metrics and metrics[0]["frequency_values"][-1] != MTF_FULL_MAX_FREQUENCY_CY_MM:
+        raise RuntimeError("OpticStudio MTF frequency setting was not applied.")
+    return metrics
+
+
+def get_fft_mtf_metrics(
+    zos: PythonStandaloneApplication, system: Any
+) -> list[dict[str, Any]]:
+    analysis = system.Analyses.New_FftMtf()
     try:
-        settings = analysis.GetSettings()
-        if hasattr(settings, "Field"):
-            settings.Field.SetFieldNumber(0)
-        if hasattr(settings, "Wavelength"):
-            settings.Wavelength.SetWavelengthNumber(0)
-        if hasattr(settings, "ReferTo"):
-            settings.ReferTo = zos.ZOSAPI.Analysis.Settings.RMS.ReferTo.Centroid
+        settings = zos.ZOSAPI.Analysis.Settings.Mtf.IAS_FftMtf(
+            analysis.GetSettings()
+        )
+        settings.Field.SetFieldNumber(0)
+        settings.Wavelength.SetWavelengthNumber(0)
+        settings.Type = zos.ZOSAPI.Analysis.Settings.Mtf.MtfTypes.Modulation
+        settings.MaximumFrequency = MTF_FULL_MAX_FREQUENCY_CY_MM
+        settings.SampleSize = zos.ZOSAPI.Analysis.SampleSizes.S_256x256
+
+        analysis.ApplyAndWaitForCompletion()
+        return _read_mtf_series(zos, analysis)
+    finally:
+        analysis.Close()
+
+
+def get_geometric_mtf_metrics(
+    zos: PythonStandaloneApplication,
+    system: Any,
+    *,
+    wavelength: int,
+) -> list[dict[str, Any]]:
+    analysis = system.Analyses.New_GeometricMtf()
+    try:
+        settings = zos.ZOSAPI.Analysis.Settings.Mtf.IAS_GeometricMtf(
+            analysis.GetSettings()
+        )
+        settings.Field.SetFieldNumber(0)
+        settings.Wavelength.SetWavelengthNumber(wavelength)
+        settings.MaximumFrequency = MTF_FULL_MAX_FREQUENCY_CY_MM
+        settings.SampleSize = zos.ZOSAPI.Analysis.SampleSizes.S_256x256
+        settings.MultiplyByDiffractionLimit = False
+
+        analysis.ApplyAndWaitForCompletion()
+        return _read_mtf_series(zos, analysis)
+    finally:
+        analysis.Close()
+
+
+def get_spot_metrics(zos: PythonStandaloneApplication, system: Any) -> list[dict[str, Any]]:
+    analysis = system.Analyses.New_StandardSpot()
+    try:
+        settings = zos.ZOSAPI.Analysis.Settings.Spot.IAS_Spot(
+            analysis.GetSettings()
+        )
+        settings.Field.SetFieldNumber(0)
+        settings.Wavelength.SetWavelengthNumber(0)
+        settings.ReferTo = zos.ZOSAPI.Analysis.Settings.Spot.Reference.Centroid
 
         analysis.ApplyAndWaitForCompletion()
         results = analysis.GetResults()
 
         field_count = int(system.SystemData.Fields.NumberOfFields)
-        metrics = []
-        for field_number in range(1, field_count + 1):
-            metrics.append(
-                {
-                    "field": field_number,
-                    "wavelength": "all",
-                    "rms_spot_radius": _as_float(
-                        results.SpotData.GetRMSSpotSizeFor(field_number, 1)
-                    ),
-                    "geo_spot_radius": _as_float(
-                        results.SpotData.GetGeoSpotSizeFor(field_number, 1)
-                    ),
-                }
-            )
-
-        return metrics
+        return [
+            {
+                "field": field_number,
+                "wavelength": "all",
+                "reference": "centroid",
+                "rms_spot_radius": _as_float(
+                    results.SpotData.GetRMSSpotSizeFor(field_number, 1)
+                ),
+                "geo_spot_radius": _as_float(
+                    results.SpotData.GetGeoSpotSizeFor(field_number, 1)
+                ),
+            }
+            for field_number in range(1, field_count + 1)
+        ]
     finally:
         analysis.Close()
 
@@ -547,6 +557,8 @@ def get_spot_diagram_points(
     raytrace = system.Tools.OpenBatchRayTrace()
     try:
         image_surface = int(system.LDE.NumberOfSurfaces)
+        lens_unit = system.SystemData.Units.LensUnits
+        coordinate_scale = _lens_unit_to_micrometers_scale(lens_unit)
         ray_data = raytrace.CreateNormUnpol(
             rays_per_field_wave,
             zos.ZOSAPI.Tools.RayTrace.RaysType.Real,
@@ -555,6 +567,7 @@ def get_spot_diagram_points(
 
         field_count = int(system.SystemData.Fields.NumberOfFields)
         wave_count = int(system.SystemData.Wavelengths.NumberOfWavelengths)
+        field_type = str(system.SystemData.Fields.GetFieldType())
         max_field_y = max(
             abs(float(system.SystemData.Fields.GetField(index).Y))
             for index in range(1, field_count + 1)
@@ -570,6 +583,14 @@ def get_spot_diagram_points(
             hy = 0.0 if max_field_y == 0 else field_y / max_field_y
 
             for wavelength_number in range(1, wave_count + 1):
+                wavelength_nm = (
+                    float(
+                        system.SystemData.Wavelengths.GetWavelength(
+                            wavelength_number
+                        ).Wavelength
+                    )
+                    * 1_000.0
+                )
                 ray_data.ClearData()
                 for _ in range(rays_per_field_wave):
                     px = rng.uniform(-1.0, 1.0)
@@ -613,8 +634,8 @@ def get_spot_diagram_points(
                 y_values = []
                 while output[0]:
                     if output[2] == 0 and output[3] == 0:
-                        x_values.append(float(output[4]))
-                        y_values.append(float(output[5]))
+                        x_values.append(float(output[4]) * coordinate_scale)
+                        y_values.append(float(output[5]) * coordinate_scale)
 
                     output = ray_data.ReadNextResult(
                         sys_int,
@@ -638,334 +659,21 @@ def get_spot_diagram_points(
                         "field": field_number,
                         "field_x": field_x,
                         "field_y": field_y,
+                        "field_type": field_type,
                         "wavelength": wavelength_number,
-                        "x": x_values,
-                        "y": y_values,
+                        "wavelength_nm": wavelength_nm,
+                        "requested_ray_count": rays_per_field_wave,
+                        "valid_ray_count": len(x_values),
+                        "coordinate_unit": SPOT_DIAGRAM_UNIT,
+                        "coordinate_source": SPOT_DIAGRAM_SOURCE,
+                        "x_um": x_values,
+                        "y_um": y_values,
                     }
                 )
 
         return points
     finally:
         raytrace.Close()
-
-
-def _plot_zemax_summary(report: dict[str, Any], output_dir: Path) -> Path:
-    import matplotlib.pyplot as plt
-
-    summary_path = output_dir / "zemax_summary.png"
-    spot_summary = report.get("spot_summary", {})
-    system_metrics = report.get("system_metrics", {})
-    distortion = system_metrics.get("distortion", {}) if isinstance(system_metrics, dict) else {}
-    mtf_summary = report.get("mtf_summary", {})
-    rows = [
-        ("Lens unit", report.get("lens_unit", "-")),
-        ("EFL", _format_number(system_metrics.get("efl_mm"), "mm")),
-        ("F/#", _format_number(system_metrics.get("fnum"))),
-        ("FOV", _format_number(system_metrics.get("fov_deg"), "deg")),
-        ("Distortion max", _format_number(distortion.get("abs_max_pct"), "%")),
-        ("MTF50 edge T", _format_number(mtf_summary.get("mtf50_edge_tangential"), "cy/mm")),
-        ("Fields", report.get("field_count", "-")),
-        ("Wavelengths", report.get("wavelength_count", "-")),
-        ("RMS min", _format_number(spot_summary.get("rms_spot_radius_min"), report.get("spot_unit"))),
-        ("RMS max", _format_number(spot_summary.get("rms_spot_radius_max"), report.get("spot_unit"))),
-        ("GEO min", _format_number(spot_summary.get("geo_spot_radius_min"), report.get("spot_unit"))),
-        ("GEO max", _format_number(spot_summary.get("geo_spot_radius_max"), report.get("spot_unit"))),
-    ]
-
-    figure, axis = plt.subplots(figsize=(8, 5))
-    axis.axis("off")
-    axis.set_title("Zemax Analysis Summary", fontsize=15, pad=18)
-    table = axis.table(
-        cellText=[[label, str(value)] for label, value in rows],
-        colLabels=["Metric", "Value"],
-        loc="center",
-        cellLoc="left",
-        colLoc="left",
-    )
-    table.auto_set_font_size(False)
-    table.set_fontsize(10)
-    table.scale(1, 1.55)
-    for (row, col), cell in table.get_celld().items():
-        cell.set_edgecolor("#d1d5db")
-        if row == 0:
-            cell.set_facecolor("#111827")
-            cell.set_text_props(color="white", weight="bold")
-        elif col == 0:
-            cell.set_facecolor("#f8fafc")
-            cell.set_text_props(weight="bold")
-    figure.tight_layout()
-    figure.savefig(summary_path, dpi=180)
-    plt.close(figure)
-    return summary_path
-
-
-def _format_number(value: Any, unit: str | None = None) -> str:
-    if value in (None, ""):
-        return "-"
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return str(value)
-    suffix = f" {unit}" if unit else ""
-    return f"{number:.6g}{suffix}"
-
-
-def _finite_positive_frequencies(mtf_series: list[dict[str, Any]]) -> list[float]:
-    finite_freqs: list[float] = []
-
-    for series in mtf_series:
-        freqs = series.get("frequency_values") or series.get("frequency_cycles_per_mm") or []
-        for raw_freq in freqs:
-            try:
-                freq = float(raw_freq)
-            except (TypeError, ValueError):
-                continue
-            if not math.isfinite(freq) or freq <= 0:
-                continue
-            finite_freqs.append(freq)
-
-    return finite_freqs
-
-
-def _finite_mtf50_values(
-    mtf_series: list[dict[str, Any]],
-    mtf_summary: dict[str, Any] | None = None,
-) -> list[float]:
-    values: list[float] = []
-    summary_series = []
-    if isinstance(mtf_summary, dict):
-        raw_summary_series = mtf_summary.get("series")
-        if isinstance(raw_summary_series, list):
-            summary_series = raw_summary_series
-
-    for series_summary in summary_series:
-        if not isinstance(series_summary, dict):
-            continue
-        for key in ("mtf50_tangential", "mtf50_sagittal"):
-            try:
-                value = float(series_summary.get(key))
-            except (TypeError, ValueError):
-                continue
-            if math.isfinite(value) and value > 0:
-                values.append(value)
-
-    if values:
-        return values
-
-    for series in mtf_series:
-        freqs = [float(value) for value in series.get("frequency_values", [])]
-        for key in ("tangential", "sagittal"):
-            mtf_values = [float(value) for value in series.get(key, [])]
-            value = _mtf50(freqs, mtf_values)
-            if value is not None and math.isfinite(value) and value > 0:
-                values.append(value)
-
-    return values
-
-
-def _suggest_mtf_diagnostic_xmax(
-    mtf_series: list[dict[str, Any]],
-    mtf_summary: dict[str, Any] | None = None,
-) -> float | None:
-    finite_freqs = _finite_positive_frequencies(mtf_series)
-
-    if not finite_freqs:
-        return None
-
-    raw_max = max(finite_freqs)
-    mtf50_values = _finite_mtf50_values(mtf_series, mtf_summary)
-    if mtf50_values:
-        diagnostic_xmax = max(MTF_DIAGNOSTIC_MIN_XMAX_CY_MM, MTF_DIAGNOSTIC_MTF50_SCALE * max(mtf50_values))
-        return min(raw_max, diagnostic_xmax)
-
-    return min(raw_max, MTF_FULL_MAX_FREQUENCY_CY_MM)
-
-
-def _suggest_mtf_full_xmax(mtf_series: list[dict[str, Any]]) -> float:
-    finite_freqs = _finite_positive_frequencies(mtf_series)
-    if not finite_freqs:
-        return MTF_FULL_MAX_FREQUENCY_CY_MM
-    return min(max(finite_freqs), MTF_FULL_MAX_FREQUENCY_CY_MM)
-
-
-def _plot_mtf_series(
-    plt: Any,
-    report: dict[str, Any],
-    *,
-    xlim_right: float | None,
-    title: str,
-) -> None:
-    colors = ("tab:blue", "tab:orange", "tab:green", "tab:red", "tab:purple")
-    mtf_series = report.get("fft_mtf", [])
-    axis_label = "Spatial frequency"
-    if mtf_series:
-        axis_label = str(mtf_series[0].get("frequency_axis_label") or axis_label)
-    if "cy/mm" not in axis_label and "cycles" not in axis_label.lower():
-        axis_label = f"{axis_label} (cy/mm)"
-
-    for series in mtf_series:
-        idx = int(series["series_index"])
-        color = colors[idx % len(colors)]
-        label = _clean_field_label_for_legend(str(series.get("field_label", "")), idx)
-        freq = series.get("frequency_values") or series.get("frequency_cycles_per_mm") or []
-        plt.plot(freq, series["tangential"], color=color, label=f"{label} T")
-        plt.plot(freq, series["sagittal"], color=color, linestyle="--", label=f"{label} S")
-
-    plt.title(title)
-    plt.xlabel(axis_label)
-    plt.ylabel("MTF")
-    plt.ylim(bottom=0)
-    if xlim_right is not None and xlim_right > 0:
-        plt.xlim(left=0, right=xlim_right)
-    plt.grid(True, alpha=0.3)
-    plt.legend(fontsize=8)
-    plt.tight_layout()
-
-
-def plot_report(
-    report: dict[str, Any],
-    output_dir: str | Path,
-    spot_diagram_points: list[dict[str, Any]] | None = None,
-) -> list[dict[str, str]]:
-    output_root = Path(output_dir).resolve()
-    output_root.mkdir(parents=True, exist_ok=True)
-
-    mpl_config_dir = output_root / ".mplconfig"
-    mpl_config_dir.mkdir(parents=True, exist_ok=True)
-    os.environ.setdefault("MPLCONFIGDIR", str(mpl_config_dir))
-
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    figures: list[dict[str, str]] = []
-
-    mtf_series = report.get("fft_mtf", [])
-
-    mtf_path = output_root / "fft_mtf.png"
-    plt.figure(figsize=(10, 6))
-    mtf_xmax = _suggest_mtf_diagnostic_xmax(mtf_series, report.get("mtf_summary"))
-    _plot_mtf_series(plt, report, xlim_right=mtf_xmax, title="FFT MTF diagnostic")
-    plt.tight_layout()
-    plt.savefig(mtf_path, dpi=180)
-    plt.close()
-
-    mtf_full_path = output_root / "fft_mtf_full.png"
-    plt.figure(figsize=(10, 6))
-    _plot_mtf_series(plt, report, xlim_right=_suggest_mtf_full_xmax(mtf_series), title="FFT MTF full range")
-    plt.tight_layout()
-    plt.savefig(mtf_full_path, dpi=180)
-    plt.close()
-
-    figures.append({"key": "fft_mtf", "title": "FFT MTF", "path": str(mtf_path)})
-
-    field_numbers = sorted({int(item["field"]) for item in report.get("spot_metrics", [])})
-    rms_by_field = []
-    geo_by_field = []
-    for field_number in field_numbers:
-        field_items = [
-            item for item in report["spot_metrics"] if int(item["field"]) == field_number
-        ]
-        rms_by_field.append(
-            sum(float(item["rms_spot_radius"]) for item in field_items) / len(field_items)
-        )
-        geo_by_field.append(
-            sum(float(item["geo_spot_radius"]) for item in field_items) / len(field_items)
-        )
-
-    spot_path = output_root / "spot_summary.png"
-    x_values = list(range(len(field_numbers)))
-    bar_width = 0.36
-    plt.figure(figsize=(8, 5))
-    plt.bar(
-        [x - bar_width / 2 for x in x_values],
-        rms_by_field,
-        width=bar_width,
-        label="RMS radius",
-        color="tab:blue",
-    )
-    plt.bar(
-        [x + bar_width / 2 for x in x_values],
-        geo_by_field,
-        width=bar_width,
-        label="GEO radius",
-        color="tab:orange",
-    )
-    plt.title("Spot Radius by Field")
-    plt.xlabel("Field")
-    plt.ylabel(f"Spot radius ({report.get('spot_unit', 'mm')})")
-    plt.xticks(x_values, [str(field_number) for field_number in field_numbers])
-    plt.grid(True, axis="y", alpha=0.3)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(spot_path, dpi=180)
-    plt.close()
-    figures.append({"key": "spot_summary", "title": "Spot Radius", "path": str(spot_path)})
-
-    if spot_diagram_points:
-        diagram_path = output_root / "spot_diagram.png"
-        field_numbers = sorted({int(item["field"]) for item in spot_diagram_points})
-        wavelength_numbers = sorted({int(item["wavelength"]) for item in spot_diagram_points})
-        figure, axes = plt.subplots(
-            1,
-            len(field_numbers),
-            figsize=(5 * len(field_numbers), 5),
-            squeeze=False,
-        )
-        wave_colors = ("tab:blue", "tab:green", "tab:red", "tab:purple", "tab:orange")
-
-        for axis, field_number in zip(axes[0], field_numbers):
-            field_points = [
-                item for item in spot_diagram_points if int(item["field"]) == field_number
-            ]
-            all_x = [float(value) for item in field_points for value in item["x"]]
-            all_y = [float(value) for item in field_points for value in item["y"]]
-            centroid_x = sum(all_x) / len(all_x) if all_x else 0.0
-            centroid_y = sum(all_y) / len(all_y) if all_y else 0.0
-            for item in field_points:
-                color = wave_colors[(int(item["wavelength"]) - 1) % len(wave_colors)]
-                axis.scatter(
-                    [float(value) - centroid_x for value in item["x"]],
-                    [float(value) - centroid_y for value in item["y"]],
-                    s=4,
-                    alpha=0.65,
-                    color=color,
-                    label=f"W{item['wavelength']}",
-                )
-
-            first = field_points[0]
-            axis.set_title(
-                "Field {field}\nX={x:.4g}, Y={y:.4g} deg".format(
-                    field=field_number,
-                    x=float(first["field_x"]),
-                    y=float(first["field_y"]),
-                )
-            )
-            axis.set_xlabel(f"Image X relative to centroid ({report.get('spot_unit', 'mm')})")
-            axis.set_ylabel(f"Image Y relative to centroid ({report.get('spot_unit', 'mm')})")
-            axis.grid(True, alpha=0.3)
-            axis.set_aspect("equal", adjustable="datalim")
-
-        handles, labels = axes[0][0].get_legend_handles_labels()
-        if handles:
-            figure.legend(
-                handles,
-                labels,
-                loc="upper center",
-                bbox_to_anchor=(0.5, 0.94),
-                ncol=len(wavelength_numbers),
-            )
-        figure.suptitle("Spot Diagram", y=0.99)
-        figure.tight_layout(rect=(0, 0, 1, 0.88))
-        figure.savefig(diagram_path, dpi=180)
-        plt.close(figure)
-        figures.append({"key": "spot_diagram", "title": "Spot Diagram", "path": str(diagram_path)})
-    else:
-        summary_path = _plot_zemax_summary(report, output_root)
-        figures.append({"key": "zemax_summary", "title": "Zemax Summary", "path": str(summary_path)})
-
-    return figures
 
 
 class ZemaxAnalysisEngine:
@@ -1017,23 +725,45 @@ class ZemaxAnalysisEngine:
             system = zos.TheSystem
             system.LoadFile(str(lens_file), False)
 
-            emit("Zemax 分析：执行 FFT MTF 与 Spot 分析。")
+            emit("Zemax 分析：执行 FFT MTF、Geometric MTF 与 Spot 分析。")
+            system_metrics = get_system_metrics(zos, system)
+            grid_distortion = get_grid_distortion_metrics(
+                zos,
+                system,
+                wavelength=system_metrics["primary_wavelength_number"],
+                text_path=output_dir / "grid_distortion.txt",
+            )
             report: dict[str, Any] = {
                 "ok": True,
                 "status": "complete",
                 "final_zmx": str(lens_file),
                 "lens_file": str(lens_file),
+                "metric_source": "zemax_zosapi",
                 "lens_unit": str(system.SystemData.Units.LensUnits),
-                "spot_unit": "um",
-                "system_metrics": get_system_metrics(zos, system, lens_file=lens_file),
+                "spot_unit": ZEMAX_STANDARD_SPOT_UNIT,
+                "spot_unit_source": ZEMAX_STANDARD_SPOT_UNIT_SOURCE,
+                "fft_mtf_definition": "polychromatic diffraction FFT MTF",
+                "geometric_mtf_definition": (
+                    "primary-wavelength geometric MTF without diffraction-limit multiplication"
+                ),
+                "system_metrics": system_metrics,
+                "grid_distortion": grid_distortion,
                 "field_count": int(system.SystemData.Fields.NumberOfFields),
                 "wavelength_count": int(system.SystemData.Wavelengths.NumberOfWavelengths),
                 "spot_metrics": get_spot_metrics(zos, system),
                 "spot_summary": {},
                 "fft_mtf": get_fft_mtf_metrics(zos, system),
+                "geometric_mtf": get_geometric_mtf_metrics(
+                    zos,
+                    system,
+                    wavelength=system_metrics["primary_wavelength_number"],
+                ),
             }
             report["spot_summary"] = summarize_spot_metrics(report["spot_metrics"])
             report["mtf_summary"] = summarize_mtf_metrics(report["fft_mtf"])
+            report["geometric_mtf_summary"] = summarize_mtf_metrics(
+                report["geometric_mtf"]
+            )
 
             spot_diagram_points: list[dict[str, Any]] | None = None
             try:

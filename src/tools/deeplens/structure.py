@@ -15,7 +15,7 @@ from engine.deeplens.structure_seed import (
 
 class DeepLensAdjustStructureTool:
     name = "deeplens_adjust_structure"
-    description = "Adjust DeepLens structure params for a later curriculum run."
+    description = "Create validated structure params for the next DeepLens curriculum run."
     category = "algorithm"
     scope = "optimization"
     input_schema = {
@@ -23,9 +23,10 @@ class DeepLensAdjustStructureTool:
         "required": ["params", "action"],
         "additionalProperties": False,
         "properties": {
-            "params": {"type": "object"},
+            "params": {"type": "object", "description": "LensDesignParams object to adjust; the active session is not mutated."},
             "action": {
                 "type": "string",
+                "description": "Structure-only adjustment to apply before a future curriculum run.",
                 "enum": [
                     "set_group_surface_count",
                     "convert_aspheric_to_spheric",
@@ -53,10 +54,8 @@ class DeepLensAdjustStructureTool:
         "kind": "structure",
         "pi": {
             "prompt_snippet": (
-                "Prepare conservative structure params for the next deeplens_curriculum call. This does "
-                "not mutate the active DeepLens session in place. Use when evidence suggests structure is "
-                "limiting the run or a fresh curriculum attempt is justified; avoid inserting it between a "
-                "healthy curriculum result and fine-tune."
+                "Prepare conservative structure params for the next deeplens_curriculum call. "
+                "This validates and returns params_override; it does not mutate the active session or optimize a lens."
             )
         },
     }

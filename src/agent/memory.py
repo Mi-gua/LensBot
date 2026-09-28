@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from agent.llm import OpenAIExtractor
+from agent.prompts import LENSBOT_CORE_SYSTEM_PROMPT
 from agent.settings import AgentInput, AgentResult
 from subagents.types import public_params_dict
 
@@ -37,26 +38,6 @@ def _emit_memory_skip(runtime: Any, ctx: Any, error: Any) -> None:
     emit = getattr(runtime, "emit_event", None)
     if callable(emit):
         emit(ctx, "workflow.memory.skipped", error=error)
-
-
-def _raw_markdown_response(value: Any) -> str | None:
-    text = str(value or "").strip()
-    if not text:
-        return None
-    if text.startswith("```"):
-        lines = text.splitlines()
-        if lines and lines[0].strip().startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
-        text = "\n".join(lines).strip()
-    if _looks_like_lesson_markdown(text):
-        return text
-    return None
-
-
-def _looks_like_lesson_markdown(text: str) -> bool:
-    return ("#" in text and "\n-" in text) or text.startswith("- ")
 
 
 class AgentMemory:
@@ -123,18 +104,24 @@ class AgentMemory:
                     "",
                     "## Role",
                     "",
-                    "- Design and optimize optical lens systems with workflow-level planning and pi-backed optimization control.",
+                    "- Design and optimize optical lens systems with staged workflow planning, local reference retrieval, DeepLens optimization, optional Zemax verification, and pi-backed optimization control.",
+                    "- LensBot is a vertical-domain optical design agent, not a general chat wrapper or a generic code assistant.",
                     "",
                     "## Tool Boundaries",
                     "",
                     "- Algorithm engines live under `src/engine`.",
                     "- Tool adapters live under `src/tools` and are registered through the unified tool registry.",
                     "- UI should stay mostly independent from workflow internals.",
+                    "- Optimization decisions should come from structured tool state, metrics, and artifacts rather than prose-only observations.",
+                    "- DeepLens is the primary optimization engine. Zemax is optional independent verification when a licensed environment is available.",
                     "",
                     "## Optical Design Priorities",
                     "",
-                    "- Preserve explicit user targets for EFL, FOV, F-number, BFL, total length, and sensor size.",
-                    "- Treat large drift in EFL/FOV/F-number as a design failure even when spot metrics improve.",
+                    "- Preserve explicit user targets for EFL, FOV, F-number, and sensor size.",
+                    "- Treat BFL and total track/thickness according to the design contract: starting geometry by default, hard packaging constraints when explicitly requested.",
+                    "- Never hide EFL/FOV/F-number drift behind spot improvement. Judge it against stated tolerances when available; otherwise report the measured drift and preserve acceptance uncertainty.",
+                    "- Keep DeepLens results exportable to ZMX and reviewable by Zemax when a licensed environment is available.",
+                    "- Report missing artifacts, unavailable verification, target drift, and weak optical quality as caveats instead of hiding them.",
                     "- Prefer reusable optical lessons over single-run summaries.",
                     "",
                 ]
@@ -175,8 +162,8 @@ class AgentMemory:
             context=context,
             instruction=(
                 "Update durable seed-selection experience. Keep lessons as short Markdown bullets "
-                "about lens family choice, native first-order proximity, stop placement, surface "
-                "complexity, and DeepLens-compatible starting structures."
+                "about lens family choice, native first-order proximity, stop placement, aperture "
+                "position, surface complexity, asphere use, and DeepLens-compatible starting structures."
             ),
         )
 
@@ -202,8 +189,9 @@ class AgentMemory:
             domain="optimization",
             context=context,
             instruction=(
-                "Update durable DeepLens optimization experience. Focus on seed characteristics, metric drift, "
-                "continue/stop/retry signals, strategy-tool choices, budget choices, and visible tool failures. "
+                "Update durable DeepLens optimization experience. Focus on seed characteristics, first-order "
+                "target drift, image-quality tradeoffs, continue/stop/retry signals, structure-adjustment "
+                "signals, strategy-tool choices, budget choices, and visible tool failures. "
                 "Do not recommend hidden optimizer internals, loss constants, or schedules that are not exposed "
                 "to the workflow."
             ),
@@ -217,7 +205,7 @@ class AgentMemory:
         result: AgentResult,
         metrics: dict[str, Any],
         references: list[dict[str, Any]],
-        accepted: bool,
+        delivery_status: str,
         issues: list[str],
     ) -> None:
         context = {
@@ -226,7 +214,7 @@ class AgentMemory:
             "run_summary": result.summary,
             "artifacts": self._result_artifact_presence(result),
             "references": references[:5],
-            "accepted": accepted,
+            "delivery_status": delivery_status,
             "issues": issues,
             "metrics": self._compact_metrics(metrics),
             "final_structure": self._surface_summary(self._safe_read_json(result.final_json)),
@@ -236,10 +224,11 @@ class AgentMemory:
             context=context,
             instruction=(
                 "Update durable post-run optical design experience. Extract general lessons from the whole "
-                "completed workflow after final analysis and report archival: seed choice, optimization behavior, "
+                "completed workflow after chosen-artifact analysis and report archival: seed choice, optimization behavior, "
                 "DeepLens-only evidence, Zemax-verified evidence, Zemax-unavailable caveats, lens-type "
-                "characteristics, and final acceptance failures. This is not a Zemax report summary; write broad "
-                "guidance useful before future seed selection and optimization."
+                "characteristics, target-drift risks, image-quality limitations, and incomplete deliveries. "
+                "This is not a Zemax report summary; write broad guidance useful before future seed selection "
+                "and optimization."
             ),
         )
 
@@ -329,6 +318,7 @@ class AgentMemory:
             return None
         return {
             "foclen": getattr(params, "foclen", None),
+            "imgh": getattr(params, "imgh", None),
             "fov": getattr(params, "fov", None),
             "fnum": getattr(params, "fnum", None),
             "bfl": getattr(params, "bfl", None),
@@ -342,19 +332,35 @@ class AgentMemory:
     def _compact_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
         keys = [
             "deeplens_efl_mm",
+            "deeplens_imgh_mm",
             "zemax_efl_mm",
-            "fnum",
+            "deeplens_fnum",
             "zemax_fnum",
+            "zemax_real_working_fnum",
             "deeplens_fov_deg",
+            "deeplens_bfl_mm",
+            "deeplens_ttl_mm",
             "zemax_fov_deg",
-            "spot_rms_um_edge",
+            "deeplens_rms_spot_um_edge",
+            "deeplens_rms_spot_um_max",
+            "deeplens_spot_valid_pct_edge",
             "zemax_spot_rms_edge_um",
-            "distortion_pct_edge",
+            "deeplens_distortion_pct_edge",
             "zemax_distortion_pct_edge",
-            "mtf50_edge_tan_cy_mm",
+            "deeplens_mtf50_edge_tan_cy_mm",
+            "deeplens_mtf50_edge_sag_cy_mm",
             "zemax_mtf50_edge_tan_cy_mm",
+            "zemax_geometric_mtf50_edge_tan_cy_mm",
+            "zemax_geometric_mtf50_edge_sag_cy_mm",
             "zemax_ok",
-            "acceptance",
+            "delivery",
+            "agent_verdict",
+            "contract_evaluation",
+            "iterations_requested",
+            "iterations_executed",
+            "source_lens",
+            "candidate_id",
+            "optimizer_reinitialized",
         ]
         return {key: metrics.get(key) for key in keys if key in metrics}
 
@@ -369,7 +375,7 @@ class AgentMemory:
             "ok": outcome.get("ok"),
             "summary": outcome.get("summary"),
             "metrics": self._compact_metrics(outcome.get("metrics", {})),
-            "final_structure": structures.get("final_summary"),
+            "final_structure": structures.get("final_structure"),
         }
 
     @staticmethod
@@ -378,6 +384,7 @@ class AgentMemory:
             return None
         return {
             "foclen": params.get("foclen"),
+            "imgh": params.get("imgh"),
             "fov": params.get("fov"),
             "fnum": params.get("fnum"),
             "bfl": params.get("bfl"),
@@ -409,8 +416,8 @@ class AgentMemory:
                 "paths": self._result_paths(result),
             },
             "optimized_structures": {
-                "curriculum_summary": self._surface_summary(curriculum_json),
-                "final_summary": self._surface_summary(final_json),
+                "curriculum_structure": self._surface_summary(curriculum_json),
+                "final_structure": self._surface_summary(final_json),
                 "curriculum_lens": curriculum_json,
                 "final_lens": final_json,
             },
@@ -436,12 +443,17 @@ class AgentMemory:
                     [
                         f"# {title}",
                         "",
-                        "这些条目是跨项目复用的工程经验，不是单次运行日志。",
-                        "请把经验写成短句，保留适用条件，并在新证据出现时修正旧条目。",
-                        "",
-                        "## 经验条目",
+                        "## Stable guidance",
                         "",
                         "- 暂无稳定经验。",
+                        "",
+                        "## Working hypotheses",
+                        "",
+                        "- 暂无工作假设。",
+                        "",
+                        "## Backend/tool notes",
+                        "",
+                        "- 暂无工具备注。",
                         "",
                     ]
                 ),
@@ -462,29 +474,25 @@ class AgentMemory:
             "domain_title": LESSON_DOMAINS[domain],
             "rules": [
                 "Return exactly one JSON object with a markdown string field.",
-                "Rewrite the whole Markdown file, preserving useful old lessons and revising them when new evidence contradicts them.",
-                "Keep the file concise: prefer 6-14 bullets total.",
-                "Write lessons as reusable engineering experience, not as one-off project reports.",
-                "Prefer conditional lessons in the form `When ..., prefer/avoid ...` whenever evidence supports a condition.",
-                "Separate confirmed lessons from weak signals; preserve existing lessons when the new evidence is weak.",
-                "Do not include run IDs, artifact paths, timestamps, absolute paths, raw JSON, tables, run logs, or long numeric dumps.",
-                "Use Markdown headings and bullet points only.",
+                "Return the complete updated Markdown file. Organize it clearly and keep it concise; headings and bullet counts are flexible.",
+                "Autonomously revise, merge, or remove existing lessons according to the evidence. Preserve useful knowledge; return it unchanged when there is nothing worth updating.",
+                "Distinguish established guidance, tentative hypotheses, and tool limitations. Do not turn a single observation into a universal rule or an unsupported causal claim.",
+                "Tool failures are not optical evidence. Missing acceptance tolerances remain unknown; do not invent thresholds from defaults or historical runs.",
+                "Keep reusable lessons rather than run logs, artifact paths, identifiers, or numeric dumps.",
             ],
             "current_markdown": current,
             "new_evidence": context,
         }
         system_prompt = "\n".join(
             [
+                LENSBOT_CORE_SYSTEM_PROMPT,
                 "You maintain LensBot's reusable optical engineering memory.",
                 instruction,
-                "Good style example: Double Gauss 类结构对中等 FOV、标准焦段更稳，但后组 asphere 可优化自由度更关键。",
                 "The Markdown must stay directly useful to the next workflow agent.",
             ]
         )
         result = self.extractor.extract_json(json.dumps(payload, ensure_ascii=False, indent=2), system_prompt)
         markdown = result.get("markdown") if isinstance(result, dict) else None
-        if not isinstance(markdown, str) or not markdown.strip():
-            markdown = _raw_markdown_response(getattr(self.extractor, "last_content", ""))
         if not isinstance(markdown, str) or not markdown.strip():
             error = str(getattr(self.extractor, "last_error", "") or "").strip()
             suffix = f": {error}" if error else ""
@@ -512,15 +520,29 @@ class AgentMemory:
         for row in rows:
             tool_call = row.get("tool_call") if isinstance(row.get("tool_call"), dict) else {}
             tool_result = row.get("tool_result") if isinstance(row.get("tool_result"), dict) else {}
+            metrics = tool_result.get("metrics") if isinstance(tool_result.get("metrics"), dict) else {}
+            state_patch = tool_result.get("state_patch") if isinstance(tool_result.get("state_patch"), dict) else {}
+            artifacts = state_patch.get("artifacts") if isinstance(state_patch.get("artifacts"), dict) else {}
+            arguments = tool_call.get("arguments", tool_call.get("input", {}))
             compact.append(
                 {
                     "agent": row.get("agent"),
                     "turn": row.get("turn"),
-                    "thought": row.get("thought"),
                     "action": tool_call.get("name") or row.get("action"),
+                    "arguments": {
+                        key: value for key, value in arguments.items()
+                        if key in {"fine_tune", "action", "reason", "lens_json", "session_id"}
+                    } if isinstance(arguments, dict) else {},
                     "observation": row.get("observation"),
                     "ok": tool_result.get("ok"),
                     "error": tool_result.get("error"),
+                    "execution": {
+                        key: metrics.get(key) for key in (
+                            "iterations_requested", "iterations_executed", "source_lens",
+                            "candidate_id", "optimizer_reinitialized", "strategy_lr_scale",
+                        ) if key in metrics
+                    },
+                    "candidate_json": artifacts.get("candidate_json"),
                 }
             )
         return compact

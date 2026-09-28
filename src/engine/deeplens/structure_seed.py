@@ -68,11 +68,8 @@ def validate_surf_list(surf_list: list[list[str]]) -> None:
     aperture = [idx for idx, group in enumerate(surf_list) if group == ["Aperture"]]
     if len(aperture) != 1:
         raise StructureSeedError("surf_list must contain exactly one ['Aperture'] group.", code="invalid_aperture")
-    stop = aperture[0]
-    if not any(_is_lens_group(group) for group in surf_list[:stop]) or not any(
-        _is_lens_group(group) for group in surf_list[stop + 1 :]
-    ):
-        raise StructureSeedError("Keep at least one lens group before and after the aperture.", code="invalid_stop_position")
+    if not any(_is_lens_group(group) for group in surf_list):
+        raise StructureSeedError("surf_list must contain at least one refractive lens group.", code="missing_lens_group")
 
 
 def structure_summary(surf_list: list[list[str]]) -> dict[str, Any]:

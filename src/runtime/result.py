@@ -19,7 +19,7 @@ class ResultWorkspace:
 
     @classmethod
     def start(cls, project_root: str | Path, run_id: Any) -> "ResultWorkspace":
-        root = Path(project_root) / "results" / safe_run_id(run_id)
+        root = _unique_result_root(Path(project_root), run_id)
         workspace = cls(root=root)
         workspace.ensure()
         return workspace
@@ -43,6 +43,7 @@ class ResultWorkspace:
             self.deeplens_dir,
             self.deeplens_live_dir,
             self.deeplens_dir / "attempts",
+            self.candidates_dir,
             self.root / "workflow",
         ):
             path.mkdir(parents=True, exist_ok=True)
@@ -71,8 +72,15 @@ class ResultWorkspace:
     def deeplens_live_dir(self) -> Path:
         return self.deeplens_dir / "live"
 
+    @property
+    def candidates_dir(self) -> Path:
+        return self.root / "candidates"
+
     def deeplens_attempt_dir(self, stage: str, index: int = 1) -> Path:
         return self.deeplens_dir / "attempts" / f"attempt-{max(1, int(index)):03d}-{safe_path_part(stage)}"
+
+    def candidate_dir(self, index: int) -> Path:
+        return self.candidates_dir / f"candidate-{max(1, int(index)):03d}"
 
     def write_workflow_artifact(self, node: str, name: str, payload: Any) -> Path:
         path = self.root / "workflow" / safe_path_part(node) / f"{safe_path_part(name)}.json"
@@ -105,13 +113,13 @@ class ResultWorkspace:
             "turn": row.get("turn"),
             "kind": row.get("kind") or "tool_turn",
             "tool": _tool_name(row),
-            "decision_summary": row.get("thought") or row.get("decision_summary"),
-            "observation": row.get("observation") or _tool_result(row).get("observation"),
+            "decision_summary": _summary_text(row.get("thought") or row.get("decision_summary"), 600),
+            "observation": _summary_text(row.get("observation") or _tool_result(row).get("observation"), 1000),
             "ok": _tool_result(row).get("ok", row.get("ok")),
             "done": row.get("done"),
             "record_path": _relative_to_root(record_path, self.root),
             "artifact_id": artifact_id(record_path, self.root),
-            "artifact_refs": _artifact_refs(row),
+            "artifact_refs": _compact_artifact_refs(_artifact_refs(row)),
         }
         with ledger_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(_jsonable(event), ensure_ascii=False) + "\n")
@@ -124,7 +132,7 @@ class ResultWorkspace:
             except (OSError, json.JSONDecodeError):
                 continue
             if isinstance(data, dict):
-                rows.append(data)
+                rows.append(_turn_view(data, path, self.root))
         transcript = [
             row
             for row in rows
@@ -145,11 +153,26 @@ class ResultWorkspace:
 def safe_run_id(value: Any) -> str:
     text = str(value or "").strip()
     if not text:
-        text = datetime.now().strftime("lensbot-%Y%m%d-%H%M%S-%f")
+        text = new_run_id()
     safe = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "-" for ch in text)
     while "--" in safe:
         safe = safe.replace("--", "-")
     return safe.strip("-_") or "lensbot-run"
+
+
+def new_run_id() -> str:
+    return datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
+def _unique_result_root(project_root: Path, run_id: Any) -> Path:
+    root = project_root / "results"
+    name = safe_run_id(run_id)
+    path = root / name
+    index = 2
+    while path.exists():
+        path = root / f"{name}-{index}"
+        index += 1
+    return path
 
 
 def safe_path_part(value: Any) -> str:
@@ -225,6 +248,90 @@ def _artifact_refs(row: JsonObject) -> list[JsonObject]:
     return artifacts if isinstance(artifacts, list) else []
 
 
+def _turn_view(row: JsonObject, record_path: Path, root: Path) -> JsonObject:
+    kind = str(row.get("kind") or "tool_turn")
+    tool_call = row.get("tool_call") if isinstance(row.get("tool_call"), dict) else {}
+    tool_result = _tool_result(row)
+    view: JsonObject = {
+        "agent": row.get("agent"),
+        "kind": kind,
+        "turn": row.get("turn"),
+        "sequence": row.get("sequence"),
+        "tool": _tool_name(row),
+        "tool_call_id": row.get("tool_call_id"),
+        "status": row.get("status"),
+        "ok": row.get("ok", tool_result.get("ok")),
+        "done": row.get("done"),
+        "duration_ms": row.get("duration_ms"),
+        "record_path": _relative_to_root(record_path, root),
+    }
+    if kind == "assistant_message":
+        view["text"] = _summary_text(row.get("text") or row.get("delta"), 4000)
+        view["message_id"] = row.get("message_id")
+    elif kind == "tool_call":
+        view["arguments"] = _bounded_value(row.get("arguments") or tool_call.get("arguments") or {})
+        view["tool_call"] = {"name": _tool_name(row), "arguments": view["arguments"]}
+    elif kind == "tool_result":
+        view["observation"] = _summary_text(row.get("observation") or tool_result.get("observation"), 1200)
+        view["metrics"] = _scalar_values(row.get("metrics") or tool_result.get("metrics"))
+        view["artifacts"] = _compact_artifact_refs(row.get("artifacts") or tool_result.get("artifacts") or [])
+        view["error"] = _bounded_value(row.get("error") or tool_result.get("error"), 1500)
+    else:
+        view["thought"] = _summary_text(row.get("thought"), 1200)
+        view["observation"] = _summary_text(row.get("observation") or tool_result.get("observation"), 1200)
+        view["text"] = _summary_text(row.get("text"), 1200)
+    return {key: value for key, value in view.items() if value not in (None, "", [], {})}
+
+
+def _compact_artifact_refs(artifacts: Any) -> list[JsonObject]:
+    if not isinstance(artifacts, list):
+        return []
+    result = []
+    for item in artifacts:
+        if isinstance(item, str):
+            result.append({"path": item})
+            continue
+        if not isinstance(item, dict):
+            continue
+        result.append(
+            {
+                key: item[key]
+                for key in ("path", "kind", "role", "source", "stage", "label")
+                if item.get(key) not in (None, "")
+            }
+        )
+    return result
+
+
+def _scalar_values(value: Any) -> JsonObject:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        str(key): item
+        for key, item in value.items()
+        if item is None or isinstance(item, (str, int, float, bool))
+    }
+
+
+def _bounded_value(value: Any, limit: int = 4000) -> Any:
+    if value in (None, "", [], {}):
+        return None
+    payload = _jsonable(value)
+    text = json.dumps(payload, ensure_ascii=False)
+    if len(text) <= limit:
+        return payload
+    if isinstance(payload, dict):
+        return {"stored_in_record": True, "keys": sorted(str(key) for key in payload)}
+    if isinstance(payload, list):
+        return {"stored_in_record": True, "items": len(payload)}
+    return _summary_text(payload, limit)
+
+
+def _summary_text(value: Any, limit: int) -> str:
+    text = " ".join(str(value or "").split())
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
 def _relative_to_root(path: Path, root: Path) -> str:
     try:
         return str(path.resolve().relative_to(root.resolve()))
@@ -253,5 +360,6 @@ __all__ = [
     "ResultWorkspace",
     "artifact_id",
     "layered_workspace_index",
+    "new_run_id",
     "safe_run_id",
 ]
